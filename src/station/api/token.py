@@ -6,7 +6,9 @@ from aiohttp import web
 
 from station.api.http import read_json_object
 from station.client.consul import fetch_prototype
-from station.client.context import ClientContext, update_client_context_prototype
+from station.client.context import ClientContext
+from station.database.consul_state import apply_consul_prototype
+from station import logger
 from station.config.config import PrototypeConfig
 from station.conductor.handlers import ensure_local_conductor
 from station.prototypes.registry import resolve_prototype_class
@@ -206,13 +208,27 @@ async def handle_admin_add_prototype(request):
     session = app["session"]
     consul_url = config.consul_url
     fetched = await fetch_prototype(session=session, consul_url=consul_url, token=token)
-    is_local = False
-    if fetched:
-        fetched_id = fetched.get("prototype_id")
-        if fetched_id is not None:
-            prototype_id = ext_int("prototype_id", fetched_id)
-        is_local = ext_bool("is_local", fetched.get("is_local", False))
-        await app["db"].put_prototype(fetched)
+    fetched_id = fetched.get("prototype_id")
+    if fetched_id is not None:
+        consul_id = ext_int("prototype_id", fetched_id)
+        if consul_id != prototype_id:
+            logger.error(
+                "prototype id conflict request=%s consul=%s; using consul",
+                prototype_id,
+                consul_id,
+            )
+            prototype_id = consul_id
+            if registry.hosts(prototype_id):
+                return web.json_response({"result": 1, "msg": "prototype_id already attached", "data": None}, status=409)
+    consul_token = fetched.get("token")
+    if consul_token and consul_token != token:
+        logger.error("prototype token conflict request_token_len=%s; using consul", len(token))
+        token = consul_token
+        if registry.authorize(token) is not None:
+            return web.json_response({"result": 1, "msg": "token already in use", "data": None}, status=409)
+    if "is_local" not in fetched:
+        raise ExternalError("fetch_prototype is_local is required")
+    is_local = ext_bool("is_local", fetched["is_local"])
 
     resolve_prototype_class(kind)
 
@@ -227,23 +243,22 @@ async def handle_admin_add_prototype(request):
         db=app["db"],
         app=app,
     )
-    if fetched:
-        update_client_context_prototype(client_context, fetched)
+    await apply_consul_prototype(app["db"], fetched, client_context)
 
-        registry.add(
-            Tenant(
-                id=prototype_id,
-                kind=kind,
-                token_state=token_state,
-                client_context=client_context,
-                config_file=config_file,
-                secret_file=secret_file,
-                ava=ava,
-                reply_to=reply_to,
-                is_local=is_local,
-            ),
-            primary=False,
-        )
+    registry.add(
+        Tenant(
+            id=prototype_id,
+            kind=kind,
+            token_state=token_state,
+            client_context=client_context,
+            config_file=config_file,
+            secret_file=secret_file,
+            ava=ava,
+            reply_to=reply_to,
+            is_local=is_local,
+        ),
+        primary=False,
+    )
 
     config.hosted_prototypes.append(
         PrototypeConfig(

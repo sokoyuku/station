@@ -1,11 +1,11 @@
 from dataclasses import dataclass
 import asyncio
-import json
 
 from station import logger
-from station.prototypes.boundary import ext_dict, ext_int, ext_str
+from station.prototypes.boundary import ext_int, ext_str
 from station.prototypes.bridge_worker import PrototypeBridgeWorker
 from station.prototypes.chat_history import load_session_id, save_session_id
+from station.timeouts import TURN_TIMEOUT_S, wait
 
 @dataclass(slots=True)
 class PendingTurnMessage:
@@ -39,11 +39,13 @@ class OpenCodeWorker(PrototypeBridgeWorker):
             await self._ensure_chat_session(gateway=gateway, state=state, acct_id=acct_id, chat_id=chat_id)
 
             state.busy = True
+            prompt_task = asyncio.create_task(gateway.prompt_async(session_id=state.session_id, parts=parts))
             try:
-                await gateway.prompt_async(session_id=state.session_id, parts=parts)
                 reply = await self._drain_session_events(gateway=gateway, state=state)
                 await gateway.maybe_compact_session(state.session_id)
             finally:
+                if prompt_task.done():
+                    await prompt_task
                 state.busy = False
 
             if reply:
@@ -75,10 +77,27 @@ class OpenCodeWorker(PrototypeBridgeWorker):
             merge_many=merge_many,
         )
 
+    async def _interrupt_backend(self, *, session_id, chat_id, acct_id):
+        gateway = self._gateway
+        if gateway is None or not session_id:
+            return
+        try:
+            await gateway.session_abort(session_id)
+        except Exception as exc:
+            logger.error(
+                "OpenCode abort on stop failed model_id=%s acct_id=%s chat_id=%s error=%s",
+                self.model_id,
+                acct_id,
+                chat_id,
+                exc,
+                exc_info=exc,
+            )
+
     async def _drop_backend_session(self, *, session_id, chat_id, acct_id):
         gateway = self._gateway
         if gateway is None or not session_id:
             return
+        await self._interrupt_backend(session_id=session_id, chat_id=chat_id, acct_id=acct_id)
         gateway.unbind_session(session_id)
 
     async def _ensure_chat_session(self, *, gateway, state, acct_id, chat_id):
@@ -110,7 +129,7 @@ class OpenCodeWorker(PrototypeBridgeWorker):
         part_message_ids = {}
 
         while True:
-            event = await queue.get()
+            event = await wait(queue.get(), TURN_TIMEOUT_S, "opencode session events")
             fatal = self._fatal_retry_message(event)
             if fatal is not None:
                 logger.error("OpenCode fatal retry session_id=%s error=%s", state.session_id, fatal)
@@ -130,21 +149,19 @@ class OpenCodeWorker(PrototypeBridgeWorker):
                 return reply
 
     def _fatal_retry_message(self, event):
-        if event.type != "session.status":
+        if event.type != "session.retry.scheduled":
             return None
-        status = event.payload.get("status")
-        if status is None:
+        error = event.payload.get("error")
+        if error is None:
             return None
-        status = ext_dict("session.status status", status)
-        status_type = ext_str("session.status type", status.get("type"))
-        if status_type != "retry":
-            return None
-        message = ext_str("session.status message", status.get("message"))
+        message = self._format_opencode_error(error)
         lowered = message.lower()
         for marker in (
             "cannot connect",
+            "unable to connect",
             "socket",
             "econn",
+            "ehostunreach",
             "fetch failed",
             "timed out",
             "timeout",
@@ -154,7 +171,7 @@ class OpenCodeWorker(PrototypeBridgeWorker):
             "other side closed",
         ):
             if marker in lowered:
-                return message or "OpenCode error"
+                return message
         return None
 
     async def _discard_until_idle(self, queue):
@@ -168,7 +185,7 @@ class OpenCodeWorker(PrototypeBridgeWorker):
                 event = await asyncio.wait_for(queue.get(), timeout=timeout)
             except asyncio.TimeoutError:
                 return
-            if event.type in {"session.idle", "session.error"}:
+            if event.type in {"session.execution.succeeded", "session.execution.failed", "session.execution.interrupted"}:
                 return
 
     def _consume_event(self, *, event, text_parts, text_order, extra_lines, user_message_ids, part_message_ids):
@@ -176,78 +193,30 @@ class OpenCodeWorker(PrototypeBridgeWorker):
         event_type = event.type
         payload = event.payload
 
-        if event_type == "message.updated":
-            info = payload.get("info")
-            if info is None:
-                return None
-            info = ext_dict("message.updated info", info)
-            role = ext_str("message.updated role", info.get("role"))
-            if role.strip() == "user":
-                message_id = ext_str("message.updated id", info.get("id"))
-                if message_id:
-                    user_message_ids.add(message_id)
+        if event_type == "session.text.delta":
+            message_id = ext_str("session.text.delta assistantMessageID", payload.get("assistantMessageID"))
+            delta = ext_str("session.text.delta delta", payload.get("delta"), strip=False)
+            if message_id and delta:
+                if message_id not in text_parts:
+                    text_parts[message_id] = ""
+                    text_order.append(message_id)
+                text_parts[message_id] += delta
             return None
 
-        if event_type == "message.part.delta":
-            message_id = ext_str("message.part.delta messageID", payload.get("messageID"))
-            if message_id and message_id in user_message_ids:
-                return None
-            part_id = ext_str("message.part.delta partID", payload.get("partID"))
-            field_name = ext_str("message.part.delta field", payload.get("field"))
-            delta = ext_str("message.part.delta delta", payload.get("delta"), strip=False)
-            if part_id and field_name in {"text", "content", ""} and delta:
-                if message_id:
-                    part_message_ids[part_id] = message_id
-                if part_id not in text_parts:
-                    text_parts[part_id] = ""
-                    text_order.append(part_id)
-                text_parts[part_id] += delta
+        if event_type == "session.text.ended":
+            message_id = ext_str("session.text.ended assistantMessageID", payload.get("assistantMessageID"))
+            text = ext_str("session.text.ended text", payload.get("text"), strip=False)
+            if message_id and text:
+                if message_id not in text_parts:
+                    text_order.append(message_id)
+                text_parts[message_id] = text
             return None
 
-        if event_type == "message.part.updated":
-            part = payload.get("part")
-            if part is None:
-                return None
-            part = ext_dict("message.part.updated part", part)
-            part_type = ext_str("message.part.updated type", part.get("type"))
-            if part_type != "text":
-                return None
-            if part.get("synthetic") is True or part.get("ignored") is True:
-                return None
-            message_id = ext_str("message.part.updated messageID", part.get("messageID"))
-            if message_id and message_id in user_message_ids:
-                return None
-            part_id = ext_str("message.part.updated id", part.get("id"))
-            if part_id:
-                if message_id:
-                    part_message_ids[part_id] = message_id
-                if part_id not in text_parts:
-                    text_order.append(part_id)
-                text_parts[part_id] = ext_str("message.part.updated text", part.get("text"), strip=False)
-            return None
-
-        if event_type == "session.error":
-            error = payload.get("error")
-            try:
-                logger.error("OpenCode session.error payload=%s", json.dumps(payload, ensure_ascii=False)[:4000])
-            except (TypeError, ValueError):
-                logger.error("OpenCode session.error payload=%r", payload)
-            extra_lines.append("OpenCode error: %s" % self._format_opencode_error(error))
+        if event_type == "session.execution.failed":
+            extra_lines.append("OpenCode error: %s" % self._format_opencode_error(payload.get("error")))
             return self._join_reply(text_parts, text_order, extra_lines, user_message_ids, part_message_ids)
 
-        if event_type == "session.status":
-            status = payload.get("status")
-            if status is None:
-                return None
-            status = ext_dict("session.status status", status)
-            status_type = ext_str("session.status type", status.get("type"))
-            if status_type == "retry":
-                message = ext_str("session.status message", status.get("message"))
-                if message:
-                    extra_lines.append("OpenCode retry: %s" % message)
-            return None
-
-        if event_type == "session.idle":
+        if event_type in {"session.execution.succeeded", "session.execution.interrupted"}:
             return (
                 self._join_reply(text_parts, text_order, extra_lines, user_message_ids, part_message_ids)
                 or "OpenCode turn finished."
@@ -260,38 +229,21 @@ class OpenCodeWorker(PrototypeBridgeWorker):
         if error is None:
             return "OpenCode error"
         if type(error) is dict:
-            name = ext_str("opencode error name", error.get("name"))
-            data = error.get("data")
-            extras = []
-            if data is not None:
-                data = ext_dict("opencode error data", data)
-                message = ext_str("opencode error data.message", data.get("message"))
-                pieces = [piece for piece in (name, message) if piece]
-                provider = ext_str("opencode error data.providerID", data.get("providerID"))
-                if provider:
-                    pieces.append("provider=%s" % provider)
-                status = data.get("statusCode")
-                if status is not None:
-                    status = ext_int("opencode error data.statusCode", status)
-                    pieces.append("status=%s" % status)
-                for key in ("cause", "error", "code", "statusText", "url", "responseBody"):
-                    value = data.get(key)
-                    if value not in (None, ""):
-                        extras.append("%s=%s" % (key, value))
-                if pieces or extras:
-                    return " | ".join(pieces + extras)
-            message = error.get("message")
-            if message is not None:
-                message = ext_str("opencode error message", message)
-            dumped = ""
-            try:
-                dumped = json.dumps(error, ensure_ascii=False)[:800]
-            except (TypeError, ValueError):
-                dumped = ""
-            text = ((message or name) or "OpenCode error").strip() or "OpenCode error"
-            if dumped:
-                return "%s | %s" % (text, dumped)
-            return text
+            kind = ext_str("opencode error type", error.get("type"))
+            message = ext_str("opencode error message", error.get("message"))
+            pieces = [piece for piece in (kind, message) if piece]
+            status = error.get("status")
+            if status is not None:
+                status = ext_int("opencode error status", status)
+                pieces.append("status=%s" % status)
+            response = error.get("response")
+            if type(response) is dict:
+                body = response.get("body")
+                if body not in (None, ""):
+                    pieces.append("body=%s" % body)
+            if pieces:
+                return " | ".join(pieces)
+            return "OpenCode error"
         return ext_str("opencode error", error) or "OpenCode error"
 
     def _join_reply(self, text_parts, text_order, extra_lines, user_message_ids, part_message_ids):

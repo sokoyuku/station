@@ -2,7 +2,6 @@ from dataclasses import dataclass
 from pathlib import Path
 import json
 
-from station.errors import ExternalError
 from station.prototypes.boundary import ext_dict, ext_mapping_get, ext_require, ext_str
 from station.prototypes.launch_settings import (
     XAI_PROVIDERS,
@@ -34,7 +33,7 @@ def load_saved_provider(storage_dir):
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except json.JSONDecodeError:
-        raise ExternalError("hermes config is not valid JSON")
+        return None
     data = ext_dict("hermes config", data)
     model = data.get("model")
     if model is None:
@@ -78,6 +77,7 @@ class HermesLaunchSettings:
     api_key: str
     voice: dict
     base_url: str
+    enabled_toolsets: list = None
 
     def uses_local_llm(self):
         return bool(self.local_llm_base_url)
@@ -93,6 +93,8 @@ class HermesLaunchSettings:
         return self.provider
 
     def tui_toolsets(self):
+        if self.enabled_toolsets is not None:
+            return ",".join(str(name).strip() for name in self.enabled_toolsets if str(name).strip())
         disabled = {name.strip().lower() for name in self.disabled_toolsets}
         return ",".join(name for name in DEFAULT_TUI_TOOLSETS if name not in disabled)
 

@@ -19,10 +19,9 @@ async def handle_webrtc_offer(request):
 
     db = app["db"]
     info = await db.get_prototype_info(tenant.id)
-    if info is None:
-        raise ExternalError("Prototype does not support calls", status=403)
-    call_support = info.get("call_support")
-    if call_support is not True:
+    if info is None or "call_support" not in info:
+        raise ExternalError("Not found", status=404)
+    if info.get("call_support") is not True:
         raise ExternalError("Prototype does not support calls", status=403)
 
     body = await read_json_object(request)

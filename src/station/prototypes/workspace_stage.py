@@ -4,6 +4,7 @@ import shutil
 import uuid
 
 from station import logger
+from station.timeouts import IO_TIMEOUT_S, wait
 from station.prototypes.attachments import attachment_str
 from station.prototypes.fs_paths import sanitize_path_component
 from station.prototypes.outbound_files import STATION_OUTBOUND_HINT
@@ -73,7 +74,11 @@ class WorkspaceAttachmentStaging:
             self._build_workspace_attachment_name(attachment=attachment, source_path=local_path),
         )
         try:
-            await asyncio.to_thread(shutil.copy2, local_path, target_path)
+            await wait(
+                asyncio.to_thread(shutil.copy2, local_path, target_path),
+                IO_TIMEOUT_S,
+                "%s copy" % self.ATTACHMENT_COPY_LABEL,
+            )
         except OSError as e:
             logger.error(
                 "%s copy failed model_id=%s source=%s target=%s error=%s",
@@ -83,7 +88,7 @@ class WorkspaceAttachmentStaging:
                 target_path,
                 e,
             )
-            return ""
+            raise
         if target_path.startswith(workspace_root + os.sep):
             attachment["workspace_path"] = os.path.relpath(target_path, workspace_root)
         else:

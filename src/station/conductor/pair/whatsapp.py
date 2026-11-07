@@ -5,6 +5,7 @@ from station.conductor.util import node_bin, whatsapp_bridge_dir
 from station import logger
 from station.errors import ExternalError
 from station.prototypes.boundary import ext_dict, ext_str
+from station.timeouts import PROCESS_STOP_TIMEOUT_S, TURN_TIMEOUT_S, read_line, wait
 
 class WhatsAppPairHandle:
     def __init__(self, proc):
@@ -17,17 +18,20 @@ class WhatsAppPairHandle:
             return
         try:
             self.proc.terminate()
-        except ProcessLookupError:
+        except ProcessLookupError as exc:
+            logger.info("whatsapp pair already exited error=%s", exc)
             return
         try:
             await asyncio.wait_for(self.proc.wait(), timeout=5)
         except asyncio.TimeoutError:
+            logger.error("whatsapp pair did not exit after terminate; killing")
             try:
                 self.proc.kill()
-            except ProcessLookupError:
-                pass
-        except ProcessLookupError:
-            pass
+            except ProcessLookupError as exc:
+                logger.info("whatsapp pair already exited error=%s", exc)
+            await wait(self.proc.wait(), PROCESS_STOP_TIMEOUT_S, "whatsapp pair kill")
+        except ProcessLookupError as exc:
+            logger.info("whatsapp pair already exited error=%s", exc)
 
 class WhatsAppPairer:
     def __init__(self, local_conductor):
@@ -63,7 +67,7 @@ class WhatsAppPairer:
             if proc.stderr is None:
                 return ""
             while True:
-                line = await proc.stderr.readline()
+                line = await read_line(proc.stderr, "whatsapp pair stderr")
                 if not line:
                     break
                 chunks.append(line)
@@ -77,7 +81,7 @@ class WhatsAppPairer:
             finished = False
             try:
                 while True:
-                    line = await proc.stdout.readline()
+                    line = await read_line(proc.stdout, "whatsapp pair stdout")
                     if not line:
                         break
                     text = line.decode("utf-8", errors="replace").strip()
@@ -85,9 +89,9 @@ class WhatsAppPairer:
                         continue
                     try:
                         event = json.loads(text)
-                    except json.JSONDecodeError:
-                        logger.warning("whatsapp pair non-json acct_id=%s", acct_id)
-                        continue
+                    except json.JSONDecodeError as exc:
+                        logger.error("whatsapp pair non-json acct_id=%s error=%s", acct_id, exc)
+                        raise ExternalError("whatsapp pair emitted non-json") from exc
                     try:
                         event = ext_dict('whatsapp pair event', event)
                         kind = event.get("event")
@@ -127,12 +131,12 @@ class WhatsAppPairer:
                             exc,
                         )
                         continue
-                code = await proc.wait()
+                code = await wait(proc.wait(), TURN_TIMEOUT_S, "whatsapp pair exit")
                 err = ""
                 try:
-                    err = await asyncio.wait_for(asyncio.shield(stderr_task), timeout=1)
-                except asyncio.TimeoutError:
-                    pass
+                    err = await wait(asyncio.shield(stderr_task), 1, "whatsapp pair stderr drain")
+                except TimeoutError as exc:
+                    logger.error("whatsapp pair stderr drain timed out acct_id=%s error=%s", acct_id, exc)
                 except asyncio.CancelledError:
                     raise
                 if err:

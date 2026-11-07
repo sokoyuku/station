@@ -137,6 +137,9 @@ def validate_inbound_message_fields(data):
     is_expired = data.get("is_expired")
     if is_expired is not None:
         ext_require("is_expired", is_expired, (bool,))
+    mentioned = data.get("mentioned")
+    if mentioned is not None:
+        ext_require("mentioned", mentioned, (bool,))
     return {
         "text": text,
         "caption": caption,
@@ -148,6 +151,7 @@ def validate_inbound_message_fields(data):
         "sender": sender,
         "attachments": attachments,
         "is_expired": False if is_expired is None else is_expired,
+        "mentioned": mentioned,
         "inbound_text": (text.strip() or caption.strip()),
     }
 

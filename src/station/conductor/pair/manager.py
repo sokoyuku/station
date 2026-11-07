@@ -2,17 +2,19 @@ import asyncio
 import os
 import time
 
+from station import instant
 from station.conductor.pair.whatsapp import WhatsAppPairer
 from station.conductor.platform_types import strip_qr_prefix
 from station import logger
 from station.errors import ExternalError
 from station.prototypes.boundary import ext_str
+from station.timeouts import BoundedLock
 
 class PairManager:
     def __init__(self, local_conductor):
         self.lc = local_conductor
         self._sessions = {}
-        self._lock = asyncio.Lock()
+        self._lock = BoundedLock(where="pair manager")
         self._pairers = {
             "whatsapp": WhatsAppPairer(local_conductor),
         }
@@ -157,7 +159,7 @@ class PairManager:
             "conductor_address": self.lc.conductor_address(),
             "status": status,
             "user_id": user_id,
-            "ts_ms": int(time.time() * 1000),
+            "ts": instant.format(instant.now()),
             "last_error_kind": ("pair_" + status) if error else "",
             "last_error_message": (error[:1024] if error else ""),
         }
@@ -165,12 +167,17 @@ class PairManager:
             path="/api/local_conductor/account_link/complete",
             payload=payload,
         )
-        if not body or body.get("result") != 0:
+        result = body.get("result")
+        if result != 0:
+            msg = body.get("msg")
             logger.error(
-                "account_link/complete failed acct_id=%s status=%s",
+                "account_link/complete failed acct_id=%s status=%s result=%s msg=%s",
                 acct_id,
                 status,
+                result,
+                msg,
             )
+            raise ExternalError("account_link/complete failed msg=%s" % msg, status=502, reason="consul_result")
 
     def session_dir(self, *, platform, acct_id):
         base = os.environ.get("LOCAL_CONDUCTOR_WHATSAPP_SESSION_DIR") or ""

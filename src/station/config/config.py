@@ -4,7 +4,7 @@ import re
 from dataclasses import dataclass
 
 from station.errors import ExternalError
-from station.prototypes.boundary import ext_bool, ext_dict, ext_list, ext_require, ext_str, parse_env_float, parse_env_int
+from station.prototypes.boundary import ext_bool, ext_dict, ext_int, ext_list, ext_require, ext_str, parse_env_float, parse_env_int
 
 def load_toml_file(path, label):
     if not os.path.exists(path):
@@ -307,6 +307,12 @@ class Config:
         )
         if secret_file is not None:
             secret_file = secret_file.strip() or None
+        if "max_models" in raw and raw["max_models"] is not None:
+            cap = ext_int(f"{label}.max_models", raw["max_models"])
+            if cap < 0:
+                raise ExternalError(f"{label}.max_models cannot be negative")
+            if cap > 2147483647:
+                raise ExternalError(f"{label}.max_models is too large")
         ava = ext_bool(
             f"{label}.ava",
             self._field_or_default(raw, "ava", False),

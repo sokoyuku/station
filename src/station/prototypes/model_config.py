@@ -1,6 +1,7 @@
 import json
 import os
 
+from station import logger
 from station.errors import ExternalError
 from station.prototypes.boundary import ext_dict, ext_require, ext_str
 from station.prototypes.fs_paths import write_atomic
@@ -40,10 +41,13 @@ def save_overlay(storage_dir, overlay):
 
 
 def clear_overlay(storage_dir):
+    path = overlay_path(storage_dir)
+    if not os.path.lexists(path):
+        return
     try:
-        os.remove(overlay_path(storage_dir))
-    except FileNotFoundError:
-        pass
+        os.remove(path)
+    except FileNotFoundError as exc:
+        logger.info("model overlay already absent path=%s error=%s", path, exc)
 
 
 def overlay_put(overlay, path, value):
@@ -282,7 +286,7 @@ class PrototypeModelConfig:
             "Provider: %s" % _redact("model.provider", provider),
             "API key: %s" % _redact(key_path, api_key),
             "Base URL: %s" % _redact("base_url", base_url),
-            "Commands: /help · /settings · /key · /model · /provider · /base_url · /config reset",
+            "Commands: /help · /stop · /settings · /key · /model · /provider · /base_url · /config reset",
             "Or send an API key as a message.",
             CONFIG_POLICY_HINT,
             SECRET_DELETE_HINT,

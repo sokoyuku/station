@@ -59,6 +59,9 @@ class CursorPrototype(PrototypeModelConfig, PrototypeWorkspace, CursorWorker, Cu
             workspace=settings.workspace_dir,
             state_root=settings.state_root,
         )
+        # Chat can save keys.cursor_api_key while launch_bridge is in flight.
+        # Rebuild so the cached snapshot includes that overlay.
+        settings = self._build_settings()
         self._settings = settings
         logger.info(
             "Cursor bridge started model_id=%s workspace=%s model=%s",

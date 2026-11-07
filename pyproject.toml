@@ -17,4 +17,4 @@ package-dir = {"" = "src"}
 where = ["src"]
 
 [tool.setuptools.dynamic]
-dependencies = {file = ["requirements.txt"]}
+dependencies = {file = ["requirements.in"]}

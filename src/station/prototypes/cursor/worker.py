@@ -1,6 +1,7 @@
 from dataclasses import dataclass, field
 
 from station import logger
+from station.timeouts import TURN_TIMEOUT_S, wait
 from station.prototypes.boundary import ext_str
 from station.prototypes.bridge_worker import PrototypeBridgeWorker
 from station.prototypes.chat_history import load_session_record, save_session_id
@@ -82,7 +83,7 @@ class CursorWorker(PrototypeBridgeWorker):
     async def _run_turn(self, *, gateway, state, chat_id, acct_id, message, image_paths):
         from cursor_sdk import CursorAgentError
 
-        settings = self._launch_settings()
+        settings = self._build_settings()
         if not settings.api_key:
             return self._secret_prompt()
         try:
@@ -103,7 +104,21 @@ class CursorWorker(PrototypeBridgeWorker):
                 agent.agent_id,
                 run.id,
             )
-            result = await run.wait()
+
+            async def _finish_run():
+                from cursor_sdk.types import SDKStatusMessage
+
+                notes = []
+                async for event in run.events():
+                    message = event.sdk_message
+                    if type(message) is not SDKStatusMessage:
+                        continue
+                    if message.message or message.status:
+                        notes.append("%s %s" % (message.status, message.message))
+                result = await run.wait()
+                return result, notes
+
+            result, status_notes = await wait(_finish_run(), TURN_TIMEOUT_S, "cursor run")
         except CursorAgentError as e:
             logger.error(
                 "CursorAgentError model_id=%s acct_id=%s chat_id=%s retryable=%s status=%s request_id=%s error=%s",
@@ -118,9 +133,30 @@ class CursorWorker(PrototypeBridgeWorker):
             return "Cursor bridge error: %s" % e
 
         status = ext_str("cursor run status", result.status)
+        text = ext_str("cursor run result", result.result, strip=False).strip()
         if status == "finished":
-            text = ext_str("cursor run result", result.result, strip=False).strip()
             return text or "Cursor turn finished."
+        detail = text
+        if status_notes:
+            detail = (detail + " " + " | ".join(status_notes)).strip()
+        if not detail:
+            try:
+                detail = await run.conversation_json()
+            except Exception as e:
+                detail = str(e)
+        logger.error(
+            "Cursor run %s model_id=%s acct_id=%s chat_id=%s run_id=%s detail=%s",
+            status,
+            self.model_id,
+            acct_id,
+            chat_id,
+            run.id,
+            detail[:2000],
+        )
+        if text:
+            return text
+        if status_notes:
+            return " ".join(status_notes).strip()
         if status == "error":
             return "Cursor run failed."
         return "Cursor run %s." % status
@@ -138,7 +174,7 @@ class CursorWorker(PrototypeBridgeWorker):
             try:
                 agent = await resume_cursor_agent(gateway=gateway, settings=settings, agent_id=agent_id)
             except CursorAgentError as e:
-                logger.info(
+                logger.error(
                     "Cursor resume failed model_id=%s acct_id=%s chat_id=%s agent_id=%s error=%s",
                     self.model_id,
                     acct_id,
@@ -146,7 +182,7 @@ class CursorWorker(PrototypeBridgeWorker):
                     agent_id,
                     e,
                 )
-                agent = None
+                raise
 
         if agent is None:
             agent = await create_cursor_agent(
@@ -177,7 +213,7 @@ class CursorWorker(PrototypeBridgeWorker):
     def _save_agent_id(self, *, acct_id, chat_id, agent_id, workspace):
         save_session_id(self.storage_dir, acct_id, chat_id, agent_id, workspace=workspace)
 
-    async def _drop_backend_session(self, *, session_id, chat_id, acct_id):
+    async def _interrupt_backend(self, *, session_id, chat_id, acct_id):
         gateway = self._gateway
         if gateway is None:
             return
@@ -189,10 +225,13 @@ class CursorWorker(PrototypeBridgeWorker):
             await agent.close()
         except Exception as e:
             logger.error(
-                "unexpected where=cursor_agent_drop model_id=%s acct_id=%s chat_id=%s error=%s",
+                "unexpected where=cursor_agent_stop model_id=%s acct_id=%s chat_id=%s error=%s",
                 self.model_id,
                 acct_id,
                 chat_id,
                 e,
                 exc_info=e,
             )
+
+    async def _drop_backend_session(self, *, session_id, chat_id, acct_id):
+        await self._interrupt_backend(session_id=session_id, chat_id=chat_id, acct_id=acct_id)

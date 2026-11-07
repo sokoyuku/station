@@ -1,11 +1,12 @@
 import asyncio
-import contextlib
+import json
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from station import logger
 from station.prototypes.boundary import ext_mapping_get, ext_result_dict, ext_str
+from station.prototypes.hermes.gateway_client import hermes_child_env
 from station.prototypes.bridge_worker import ChatBridgeState, PrototypeBridgeWorker
 from station.prototypes.chat_history import load_session_id, save_session_id
 from station.prototypes.outbound_files import STATION_OUTBOUND_HINT
@@ -138,6 +139,9 @@ class HermesWorker(PrototypeVoice, PrototypeBridgeWorker):
         message = batch[0] if len(batch) == 1 else None
         if message is not None and message.preserve_slash_commands:
             cmd, _args = self._slash_command(message.raw_text)
+            # Station-owned commands never become model prompts.
+            if cmd and self._owns_station_command(cmd):
+                return
             if cmd and cmd not in {"/login", "/logout", "/start"}:
                 await self._handle_slash_command(
                     gateway=gateway,
@@ -166,20 +170,38 @@ class HermesWorker(PrototypeVoice, PrototypeBridgeWorker):
     def _chat_session_title(self, acct_id, chat_id):
         return "station:%s:%s" % (acct_id, chat_id)
 
+    async def _interrupt_backend(self, *, session_id, chat_id, acct_id):
+        gateway = self._gateway
+        if gateway is None or not session_id:
+            return
+        try:
+            await gateway.interrupt_session(session_id=session_id)
+        except Exception as exc:
+            logger.error(
+                "Hermes interrupt on stop failed model_id=%s acct_id=%s chat_id=%s error=%s",
+                self.model_id,
+                acct_id,
+                chat_id,
+                exc,
+                exc_info=exc,
+            )
+
     async def _drop_backend_session(self, *, session_id, chat_id, acct_id):
         gateway = self._gateway
         if gateway is None or not session_id:
             return
         try:
             await gateway.interrupt_session(session_id=session_id)
-        except Exception:
-            logger.info(
-                "Hermes interrupt on restart failed model_id=%s acct_id=%s chat_id=%s",
+        except Exception as exc:
+            logger.error(
+                "Hermes interrupt on restart failed model_id=%s acct_id=%s chat_id=%s error=%s",
                 self.model_id,
                 acct_id,
                 chat_id,
-                exc_info=True,
+                exc,
+                exc_info=exc,
             )
+            raise
 
     async def _ensure_chat_session(self, *, gateway, state, acct_id, chat_id):
         if state.session_id:
@@ -460,10 +482,39 @@ class HermesWorker(PrototypeVoice, PrototypeBridgeWorker):
             return "%s%s\nReply with the secret value to continue." % (prompt, suffix)
         return "Hermes requested a sudo password.\nReply with the password to continue."
 
+    async def _run_speech(self, command, payload):
+        settings = self._settings
+        hermes_home = self._hermes_home
+        if settings is None or hermes_home is None:
+            raise RuntimeError("Hermes voice reply settings are not initialized")
+        env = hermes_child_env(settings, hermes_home)
+        script = str(Path(__file__).resolve().parent / "speech_runtime.py")
+        proc = await asyncio.create_subprocess_exec(
+            settings.hermes_python,
+            script,
+            command,
+            cwd=str(settings.hermes_root),
+            env=env,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            stdout, stderr = await asyncio.wait_for(proc.communicate(json.dumps(payload).encode()), timeout=300)
+        except asyncio.TimeoutError:
+            proc.kill()
+            raise RuntimeError("speech runtime timed out")
+        if proc.returncode != 0 or not stdout.strip():
+            detail = stderr.decode("utf-8", "replace").strip() or stdout.decode("utf-8", "replace").strip()
+            raise RuntimeError(detail or "speech runtime exited %s" % proc.returncode)
+        result = json.loads(stdout.decode("utf-8", "replace").strip().splitlines()[-1])
+        if type(result) is not dict:
+            raise RuntimeError("speech runtime returned %s" % type(result).__name__)
+        return result
+
     async def _prepare_voice_input(self, *, attachments):
         async def transcribe(_attachment, local_path, display_name):
-            gateway = await self._ensure_gateway()
-            result = await gateway.request("audio.transcribe", {"file_path": local_path}, timeout_s=300.0)
+            result = await self._run_speech("transcribe", {"file_path": local_path})
             result = ext_result_dict("audio.transcribe result", result)
             transcript = ext_mapping_get(result, "transcript", (str,), "").strip()
             if result.get("success") and transcript:
@@ -509,8 +560,7 @@ class HermesWorker(PrototypeVoice, PrototypeBridgeWorker):
     async def _send_voice(self, *, chat_id, acct_id, text, platform="", chat_type=""):
         output_path = Path(self.storage_dir) / "voice_replies" / ("%s.ogg" % uuid.uuid4().hex)
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        gateway = await self._ensure_gateway()
-        result = await gateway.request("audio.synthesize", {"text": text, "output_path": str(output_path)}, timeout_s=300.0)
+        result = await self._run_speech("synthesize", {"text": text, "output_path": str(output_path)})
         result = ext_result_dict("audio.synthesize result", result)
         if not result.get("success"):
             raise RuntimeError(ext_mapping_get(result, "error", (str,), "unknown TTS error"))
@@ -521,8 +571,10 @@ class HermesWorker(PrototypeVoice, PrototypeBridgeWorker):
         try:
             audio_bytes = file_path.read_bytes()
         finally:
-            with contextlib.suppress(OSError):
+            try:
                 file_path.unlink()
+            except OSError as exc:
+                logger.error("hermes voice file cleanup failed path=%s error=%s", file_path, exc)
         content_type = ""
         if file_path.suffix.lower() in {".ogg", ".opus"}:
             content_type = "audio/ogg"

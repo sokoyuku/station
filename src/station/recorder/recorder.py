@@ -9,6 +9,7 @@ from logging.handlers import RotatingFileHandler
 from aiohttp import web
 
 from station.api.http import external_response, log_caught
+from station.instant import format as format_instant
 from station.errors import ExternalError
 
 from .context import request_id_var
@@ -25,8 +26,7 @@ class RequestIdFilter(logging.Filter):
 
 class TZFormatter(logging.Formatter):
     def formatTime(self, record, datefmt=None):
-        dt = datetime.fromtimestamp(record.created, tz=timezone.utc).astimezone()
-        return dt.isoformat(sep=" ", timespec="milliseconds")
+        return format_instant(datetime.fromtimestamp(record.created, tz=timezone.utc))
 
 def bootstrap_logger(name="station"):
     level_name = (os.getenv("LOG_LEVEL") or "INFO").upper()

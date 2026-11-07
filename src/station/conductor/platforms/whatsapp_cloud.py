@@ -15,6 +15,11 @@ from station.conductor.crypto import decrypt_if_encrypted
 from station.conductor.platforms.base import LocalPlatformAdapter
 from station.conductor.platforms import guidance
 from station.conductor.platforms.policy import media_ref_action
+from station.conductor.platforms.whatsapp_mention import (
+    collect_whatsapp_mentioned_ids,
+    is_whatsapp_broadcast_chat,
+    whatsapp_mentions_bot,
+)
 from station.conductor.util import apply_sender, constant_time_equal, err, ext_str, ext_id, ext_int, catch_external
 from station import logger
 from station.errors import ExternalError
@@ -478,12 +483,14 @@ class WhatsAppCloudIO:
                 return None
             return await resp.read()
 
-    def parse_cloud_message(self, raw_message, contacts_by_waid=None):
+    def parse_cloud_message(self, raw_message, contacts_by_waid=None, bot_ids=None):
         raw_message = ext_dict('whatsapp_cloud message', raw_message)
         if contacts_by_waid is None:
             contacts_by_waid = {}
         else:
             contacts_by_waid = ext_dict('whatsapp_cloud contacts_by_waid', contacts_by_waid)
+        if bot_ids is None:
+            bot_ids = []
         msg_type = ext_str(raw_message.get("type"), "type", default="text").lower()
         sender_id = ext_id(raw_message.get("from"), "from").strip()
         if not sender_id:
@@ -616,14 +623,17 @@ class WhatsAppCloudIO:
                 "sender_name": ext_str(contacts_by_waid.get(sender_id), "sender_name"),
                 "msg_type": msg_type,
                 "raw": None,
+                "mentioned": False,
             }
         else:
             raw = raw_message
         reply_to = ""
+        quoted_participant = ""
         context = raw_message.get("context")
         if context is not None:
             context = ext_dict('whatsapp_cloud context', context)
             reply_to = ext_id(context.get("id"), "id").strip()
+            quoted_participant = ext_id(context.get("from"), "from").strip()
         from station.conductor.platforms import whatsapp_replyindex
 
         record_text = text or caption
@@ -639,6 +649,21 @@ class WhatsAppCloudIO:
             if notes:
                 joined = "\n".join(notes)
                 text = f"{text}\n{joined}".strip() if text else joined
+        if chat_type != "group":
+            mentioned = True
+        elif is_whatsapp_broadcast_chat(chat_id):
+            mentioned = False
+        elif msg_type in ("button", "interactive"):
+            mentioned = True
+        else:
+            mentioned = whatsapp_mentions_bot(
+                text=text,
+                caption=caption,
+                mentioned_ids=collect_whatsapp_mentioned_ids(raw_message, raw_message.get("text"), context),
+                quoted_participant=quoted_participant,
+                bot_ids=bot_ids,
+                broadcast=is_whatsapp_broadcast_chat(chat_id),
+            )
         return {
             "msg_id": wamid,
             "chat_id": chat_id,
@@ -652,6 +677,7 @@ class WhatsAppCloudIO:
             "sender_name": ext_str(contacts_by_waid.get(sender_id), "sender_name"),
             "msg_type": msg_type,
             "raw": raw,
+            "mentioned": mentioned,
         }
 
     async def process_payload(self, *, acct_id, payload):
@@ -677,6 +703,13 @@ class WhatsAppCloudIO:
                 value = change.get("value")
                 value = ext_dict('whatsapp_cloud change value', value)
                 contacts_by_waid = {}
+                metadata = value.get("metadata")
+                bot_ids = []
+                if metadata is not None:
+                    metadata = ext_dict("whatsapp_cloud metadata", metadata)
+                    display_phone = ext_str(metadata.get("display_phone_number"), "display_phone_number").strip()
+                    if display_phone:
+                        bot_ids.append(display_phone)
                 contacts = value.get("contacts")
                 if contacts is None:
                     contacts = []
@@ -701,7 +734,7 @@ class WhatsAppCloudIO:
                     wamid = ext_id(raw_message.get("id"), "id").strip()
                     if self._is_wamid_seen(wamid):
                         continue
-                    parsed = self.parse_cloud_message(raw_message, contacts_by_waid)
+                    parsed = self.parse_cloud_message(raw_message, contacts_by_waid, bot_ids=bot_ids)
                     if not parsed:
                         continue
                     remember_id = wamid if wamid else ext_id(parsed.get("msg_id"), "msg_id")
@@ -747,6 +780,8 @@ class WhatsAppCloudIO:
                         body["reply_to_text"] = parsed["reply_to_text"]
                     if parsed.get("raw") is not None:
                         body["raw"] = parsed["raw"]
+                    if parsed.get("mentioned") is not None:
+                        body["mentioned"] = bool(parsed["mentioned"])
                     ok = await self.conductor.deliver_inbound(
                         model_id=model_id,
                         acct_id=acct_id,

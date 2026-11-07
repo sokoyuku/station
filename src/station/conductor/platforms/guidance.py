@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import html
 import os
 import re
 from typing import Callable, Optional
@@ -12,7 +11,6 @@ MAX_TELEGRAM_MESSAGE_LENGTH = 4096
 MAX_TELEGRAM_CAPTION_LENGTH = 1024
 MAX_DISCORD_MESSAGE_LENGTH = 2000
 MAX_DISCORD_SPLIT_MESSAGES = 8
-MAX_MATRIX_MESSAGE_LENGTH = 16000
 MAX_WHATSAPP_MESSAGE_LENGTH = 4096
 MAX_QQ_MESSAGE_LENGTH = 4000
 
@@ -24,7 +22,6 @@ _TRAILING_OPEN_FENCE_RE = re.compile(r"```[^`]*$")
 _PLATFORM_MAX = {
     "telegram": MAX_TELEGRAM_MESSAGE_LENGTH,
     "discord": MAX_DISCORD_MESSAGE_LENGTH,
-    "matrix": MAX_MATRIX_MESSAGE_LENGTH,
     "whatsapp": MAX_WHATSAPP_MESSAGE_LENGTH,
     "whatsapp_cloud": MAX_WHATSAPP_MESSAGE_LENGTH,
     "qq": MAX_QQ_MESSAGE_LENGTH,
@@ -36,7 +33,6 @@ _PLATFORM_CAPTION_MAX = {
     "whatsapp_cloud": MAX_WHATSAPP_MESSAGE_LENGTH,
     "qq": MAX_QQ_MESSAGE_LENGTH,
     "discord": MAX_DISCORD_MESSAGE_LENGTH,
-    "matrix": MAX_MATRIX_MESSAGE_LENGTH,
 }
 
 _MDV2_ESCAPE_RE = re.compile(r"([_*\[\]()~`>#+\-=|{}.!\\])")
@@ -68,15 +64,7 @@ _WA_HEADER_RE = re.compile(r"(?m)^#{1,6}\s+(.+)$")
 _WA_LINK_RE = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
 _WA_SINGLE_STAR_RE = re.compile(r"\*([^*\n]+)\*")
 
-_MATRIX_IMAGE_MD_RE = re.compile(r"!\[[^\]]*\]\(([^)]+)\)")
 _TELEGRAM_CHUNK_INDEX_RE = re.compile(r" \((\d+)/(\d+)\)$")
-_MATRIX_FENCE_RE = re.compile(r"(?s)```([^\n]*)\n(.*?)```")
-_MATRIX_INLINE_RE = re.compile(r"`([^`]+)`")
-_MATRIX_LINK_RE = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
-_MATRIX_BOLD_RE = re.compile(r"\*\*(.+?)\*\*")
-_MATRIX_ITALIC_RE = re.compile(r"\*([^*\n]+)\*")
-_MATRIX_STRIKE_RE = re.compile(r"~~(.+?)~~")
-_MATRIX_HEADER_RE = re.compile(r"(?m)^(#{1,6})\s+(.+)$")
 
 _QQ_BOLD_RE = re.compile(r"\*\*(.+?)\*\*")
 _QQ_ITALIC_STAR_RE = re.compile(r"\*([^*\n]+)\*")
@@ -111,6 +99,8 @@ def max_caption_length(platform: str) -> int:
     return _PLATFORM_CAPTION_MAX.get((platform or "").strip().lower(), MAX_TELEGRAM_CAPTION_LENGTH)
 
 def uses_utf16_length(platform: str) -> bool:
+    # Hermes counts Telegram in UTF-16 code units. Other adapters count
+    # message bodies with Python len(), which is Unicode code points.
     return (platform or "").strip().lower() == "telegram"
 
 def _custom_unit_to_cp(s: str, budget: int, len_fn: LenFn) -> int:
@@ -474,56 +464,6 @@ def format_discord_message(content: str) -> str:
         return content
     return convert_tables_to_bullets(content)
 
-def format_matrix_message(content: str) -> str:
-    if not content:
-        return content
-    return _MATRIX_IMAGE_MD_RE.sub(r"\1", content).strip()
-
-def matrix_html(content: str) -> str:
-
-    if not content:
-        return ""
-    text = format_matrix_message(content)
-    placeholders: list[tuple[str, str]] = []
-
-    def protect(value: str) -> str:
-        key = f"\x00MH{len(placeholders)}\x00"
-        placeholders.append((key, value))
-        return key
-
-    def fence_repl(m: re.Match) -> str:
-        lang = (m.group(1) or "").strip()
-        body = html.escape(m.group(2) or "")
-        class_attr = f' class="language-{html.escape(lang)}"' if lang else ""
-        return protect(f"<pre><code{class_attr}>{body}</code></pre>")
-
-    text = _MATRIX_FENCE_RE.sub(fence_repl, text)
-    text = _MATRIX_INLINE_RE.sub(lambda m: protect("<code>" + html.escape(m.group(1)) + "</code>"), text)
-
-    def link_repl(m: re.Match) -> str:
-        label = html.escape(m.group(1))
-        href = html.escape(m.group(2))
-        if href.lower().startswith("javascript:"):
-            return label
-        return protect(f'<a href="{href}">{label}</a>')
-
-    text = _MATRIX_LINK_RE.sub(link_repl, text)
-
-    def header_repl(m: re.Match) -> str:
-        level = len(m.group(1))
-        level = max(1, min(6, level))
-        return protect(f"<h{level}>{html.escape(m.group(2))}</h{level}>")
-
-    text = _MATRIX_HEADER_RE.sub(header_repl, text)
-    text = _MATRIX_BOLD_RE.sub(lambda m: protect("<strong>" + html.escape(m.group(1)) + "</strong>"), text)
-    text = _MATRIX_ITALIC_RE.sub(lambda m: protect("<em>" + html.escape(m.group(1)) + "</em>"), text)
-    text = _MATRIX_STRIKE_RE.sub(lambda m: protect("<del>" + html.escape(m.group(1)) + "</del>"), text)
-
-    escaped = html.escape(text)
-    for key, value in reversed(placeholders):
-        escaped = escaped.replace(html.escape(key), value)
-    return escaped.replace("\n", "<br/>")
-
 def qq_markdown_enabled() -> bool:
     v = (os.environ.get("QQ_MARKDOWN_SUPPORT") or "").strip()
     return v == "" or (v != "0" and v.lower() != "false")
@@ -547,19 +487,6 @@ def format_qq_message(content: str) -> str:
         return content
     return strip_markdown(content)
 
-def prepare_matrix_media_caption(caption: str, fallback: str = "") -> tuple[str, str]:
-    cap = (caption or "").strip()
-    if not cap:
-        return fallback, ""
-    body = prepare_outbound_caption("matrix", cap)
-    if not body:
-        return fallback, ""
-    html = matrix_html(body)
-    if not html or html == body:
-        return body, ""
-    return body, html
-
-
 def format_outbound_text(platform: str, text: str) -> str:
     p = (platform or "").strip().lower()
     kind = classify_outbound(text)
@@ -575,8 +502,6 @@ def format_outbound_text(platform: str, text: str) -> str:
         return format_whatsapp_message(text)
     if p == "discord":
         return format_discord_message(text)
-    if p == "matrix":
-        return format_matrix_message(text)
     if p == "qq":
         return format_qq_message(text)
     return text
@@ -782,7 +707,6 @@ def format_reaction_text(emojis=None, custom_emoji_ids=None) -> str:
 MAX_TELEGRAM_MEDIA_BYTES = 20 * 1024 * 1024
 MAX_TELEGRAM_MEDIA_LOCAL_BYTES = 2 * 1024 * 1024 * 1024
 MAX_DISCORD_MEDIA_BYTES = 32 * 1024 * 1024
-MAX_MATRIX_MEDIA_BYTES = 100 * 1024 * 1024
 MAX_WHATSAPP_IMAGE_BYTES = 5 * 1024 * 1024
 MAX_WHATSAPP_VIDEO_BYTES = 16 * 1024 * 1024
 MAX_WHATSAPP_AUDIO_BYTES = 16 * 1024 * 1024
@@ -876,8 +800,6 @@ def max_media_bytes(platform: str, kind: str = "document", *, telegram_base_url:
         return max_telegram_media_bytes(telegram_base_url)
     if platform == "discord":
         return env_int("DISCORD_MAX_ATTACHMENT_BYTES", MAX_DISCORD_MEDIA_BYTES)
-    if platform == "matrix":
-        return env_int("MATRIX_MAX_MEDIA_BYTES", MAX_MATRIX_MEDIA_BYTES)
     if platform in ("whatsapp", "whatsapp_cloud"):
         return {
             "image": MAX_WHATSAPP_IMAGE_BYTES,

@@ -1,16 +1,16 @@
 import asyncio
-import contextlib
 from dataclasses import dataclass, field
 
 from station import logger
 from station.prototypes.chat_history import clear_chat_history
+from station.timeouts import PROCESS_STOP_TIMEOUT_S, BoundedLock, wait
 
 @dataclass(slots=True)
 class ChatBridgeState:
     session_id: str = ""
     busy: bool = False
     pending_messages: list = field(default_factory=list)
-    guard: asyncio.Lock = field(default_factory=asyncio.Lock)
+    guard: asyncio.Lock = field(default_factory=lambda: BoundedLock(where="bridge chat"))
     worker_task: object = None
     platform: str = ""
     chat_type: str = ""
@@ -18,7 +18,7 @@ class ChatBridgeState:
 class PrototypeBridgeWorker:
     def _init_bridge_worker(self, *, worker_name):
         self._chat_states = {}
-        self._chat_states_guard = asyncio.Lock()
+        self._chat_states_guard = BoundedLock(where="bridge chats")
         self._bridge_worker_name = worker_name
 
     def _new_chat_state(self):
@@ -56,8 +56,10 @@ class PrototypeBridgeWorker:
             task = state.worker_task
             if task is not None:
                 task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await task
+                try:
+                    await wait(task, PROCESS_STOP_TIMEOUT_S, "bridge worker")
+                except asyncio.CancelledError:
+                    logger.info("bridge worker cancelled name=%s", task.get_name())
 
     async def _pop_pending_messages(self, *, state):
         async with state.guard:
@@ -151,12 +153,39 @@ class PrototypeBridgeWorker:
             state.worker_task = None
         if task is not None:
             task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await task
+            try:
+                await wait(task, PROCESS_STOP_TIMEOUT_S, "bridge worker")
+            except asyncio.CancelledError:
+                logger.info("bridge worker cancelled name=%s", task.get_name())
         return session_id
 
     async def _drop_backend_session(self, *, session_id, chat_id, acct_id):
         return
+
+    async def _interrupt_backend(self, *, session_id, chat_id, acct_id):
+        return
+
+    async def _stop_chat(self, *, chat_id, acct_id):
+        if not acct_id or not chat_id:
+            return
+        state = await self._get_chat_state(acct_id=acct_id, chat_id=chat_id)
+        async with state.guard:
+            session_id = state.session_id
+            state.pending_messages.clear()
+            state.busy = False
+            if hasattr(state, "pending_request"):
+                state.pending_request = None
+            task = state.worker_task
+            state.worker_task = None
+        if session_id:
+            await self._interrupt_backend(session_id=session_id, chat_id=chat_id, acct_id=acct_id)
+        if task is not None:
+            task.cancel()
+            try:
+                await wait(task, PROCESS_STOP_TIMEOUT_S, "bridge worker stop")
+            except asyncio.CancelledError:
+                logger.info("bridge worker stopped name=%s", task.get_name())
+        await super()._stop_chat(chat_id=chat_id, acct_id=acct_id)
 
     async def _restart_chat(self, *, chat_id, acct_id):
         if not acct_id or not chat_id:

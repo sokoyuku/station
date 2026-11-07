@@ -6,16 +6,19 @@ import time
 
 from station.conductor.platforms import guidance
 from station.conductor.platforms.base import LocalPlatformAdapter
-from station.conductor.util import node_bin, whatsapp_bridge_dir, ext_int, ext_str, ext_id
+from station.conductor.platforms.whatsapp_mention import is_whatsapp_broadcast_chat
+from station.conductor.util import node_bin, whatsapp_bridge_dir, ext_int, ext_str, ext_id, ext_bool
 from station import logger
 from station.prototypes.boundary import ext_dict, ext_list
+from station.errors import ExternalError
+from station.timeouts import BoundedLock, http_timeout
 
 class WhatsAppIO:
     def __init__(self, conductor):
         self.conductor = conductor
         self._serve_procs = {}
         self._serve_ports = {}
-        self._serve_lock = asyncio.Lock()
+        self._serve_lock = BoundedLock(where="whatsapp bridge")
 
     def session_dir(self, acct_id):
         return self.conductor.pair_manager.session_dir(platform="whatsapp", acct_id=acct_id)
@@ -54,13 +57,15 @@ class WhatsAppIO:
                         timeout=max(0.1, deadline - time.time()),
                     )
                 except asyncio.TimeoutError:
+                    logger.error("whatsapp bridge listen timed out acct_id=%s", acct_id)
                     break
                 if not line:
                     break
                 try:
                     evt = json.loads(line.decode("utf-8", errors="replace").strip())
-                except json.JSONDecodeError:
-                    continue
+                except json.JSONDecodeError as exc:
+                    logger.error("whatsapp bridge malformed JSON acct_id=%s error=%s", acct_id, exc)
+                    raise ExternalError("whatsapp bridge malformed JSON") from exc
                 evt = ext_dict('whatsapp bridge event', evt)
                 if evt.get("event") == "listening":
                     port = ext_int(evt.get("port"), "port")
@@ -68,8 +73,8 @@ class WhatsAppIO:
             if not port:
                 try:
                     proc.kill()
-                except ProcessLookupError:
-                    pass
+                except ProcessLookupError as exc:
+                    logger.info("whatsapp bridge already exited acct_id=%s error=%s", acct_id, exc)
                 return None
             self._serve_procs[acct_id] = proc
             self._serve_ports[acct_id] = port
@@ -78,9 +83,10 @@ class WhatsAppIO:
     async def fetch_messages(self, port):
         session = self.conductor.session
         url = f"http://127.0.0.1:{int(port)}/messages"
-        async with session.get(url) as resp:
+        async with session.get(url, timeout=http_timeout()) as resp:
             if resp.status != 200:
-                return []
+                raw = await resp.text()
+                raise ExternalError("whatsapp messages failed status=%s body=%s" % (resp.status, raw[:300]))
             body = await resp.json(content_type=None)
         body = ext_dict('whatsapp messages body', body)
         messages = body.get("messages")
@@ -95,12 +101,15 @@ class WhatsAppIO:
         payload = {"chat_id": chat_id, "text": text}
         if reply_to:
             payload["reply_to"] = reply_to
-        async with session.post(url, json=payload) as resp:
+        async with session.post(url, json=payload, timeout=http_timeout()) as resp:
+            raw = await resp.text()
             if resp.status != 200:
-                return False
-            body = await resp.json(content_type=None)
-        body = ext_dict('whatsapp send body', body)
-        return bool(body.get("ok"))
+                raise ExternalError("whatsapp send failed status=%s body=%s" % (resp.status, raw[:300]))
+            body = json.loads(raw)
+        body = ext_dict("whatsapp send body", body)
+        if not body.get("ok"):
+            raise ExternalError("whatsapp send failed body=%s" % raw[:300])
+        return True
 
     async def send_media(self, *, port, chat_id, kind, file_bytes, filename="", mime="", caption="", reply_to=None):
         session = self.conductor.session
@@ -115,12 +124,15 @@ class WhatsAppIO:
         }
         if reply_to:
             payload["reply_to"] = reply_to
-        async with session.post(url, json=payload) as resp:
+        async with session.post(url, json=payload, timeout=http_timeout()) as resp:
+            raw = await resp.text()
             if resp.status != 200:
-                return False
-            body = await resp.json(content_type=None)
-        body = ext_dict('whatsapp send-media body', body)
-        return bool(body.get("ok"))
+                raise ExternalError("whatsapp send-media failed status=%s body=%s" % (resp.status, raw[:300]))
+            body = json.loads(raw)
+        body = ext_dict("whatsapp send-media body", body)
+        if not body.get("ok"):
+            raise ExternalError("whatsapp send-media failed body=%s" % raw[:300])
+        return True
 
     async def download_media(self, *, port, media_id):
         media_id = (media_id or "").strip()
@@ -128,9 +140,10 @@ class WhatsAppIO:
             return None
         session = self.conductor.session
         url = f"http://127.0.0.1:{int(port)}/media/{media_id}"
-        async with session.get(url) as resp:
+        async with session.get(url, timeout=http_timeout()) as resp:
             if resp.status != 200:
-                return None
+                raw = await resp.text()
+                raise ExternalError("whatsapp media download failed status=%s body=%s" % (resp.status, raw[:300]))
             return await resp.read()
 
     async def close(self):
@@ -139,8 +152,8 @@ class WhatsAppIO:
                 if proc and proc.returncode is None:
                     try:
                         proc.kill()
-                    except ProcessLookupError:
-                        continue
+                    except ProcessLookupError as exc:
+                        logger.info("whatsapp bridge already exited error=%s", exc)
             self._serve_procs.clear()
             self._serve_ports.clear()
 
@@ -231,7 +244,7 @@ class WhatsAppAdapter(LocalPlatformAdapter):
         acct_id = acct.get("acct_id") or ""
         port = await self.io.ensure_bridge(acct_id)
         if not port:
-            return None
+            raise ExternalError("whatsapp bridge is not running acct_id=%s" % acct_id)
         return await self.io.download_media(port=port, media_id=file_id)
 
     async def poller_loop(self, acct_id):
@@ -271,7 +284,10 @@ class WhatsAppAdapter(LocalPlatformAdapter):
                         )
                     native_chat = ext_str(msg.get("chat_type"), "chat_type").strip().lower()
                     if not native_chat:
-                        native_chat = "group" if chat_id.endswith("@g.us") else "private"
+                        if chat_id.endswith("@g.us") or is_whatsapp_broadcast_chat(chat_id):
+                            native_chat = "group"
+                        else:
+                            native_chat = "private"
                     body = {
                         "text": text,
                         "caption": ext_str(msg.get("caption"), "caption"),
@@ -282,6 +298,8 @@ class WhatsAppAdapter(LocalPlatformAdapter):
                         "attachments": attachments,
                         "msg_id": message_id,
                     }
+                    if msg.get("mentioned") is not None:
+                        body["mentioned"] = ext_bool(msg.get("mentioned"), "mentioned")
                     reply_to = ext_str(msg.get("reply_to"), "reply_to").strip()
                     if reply_to:
                         body["reply_to"] = reply_to

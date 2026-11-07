@@ -3,6 +3,7 @@ import base64
 from pathlib import Path
 
 from station import logger
+from station.timeouts import IO_TIMEOUT_S, wait
 from station.prototypes.attachments import attachment_str, is_image_attachment
 from station.prototypes.workspace_stage import WorkspaceAttachmentStaging
 
@@ -53,7 +54,7 @@ class PiAttachments(WorkspaceAttachmentStaging):
         if not path.is_file():
             return None
         try:
-            data = await asyncio.to_thread(path.read_bytes)
+            data = await wait(asyncio.to_thread(path.read_bytes), IO_TIMEOUT_S, "pi image read")
         except OSError as e:
             logger.error(
                 "Pi image read failed model_id=%s path=%s error=%s",
@@ -61,7 +62,7 @@ class PiAttachments(WorkspaceAttachmentStaging):
                 local_path,
                 e,
             )
-            return None
+            raise
         mime = attachment_str(attachment, "mime_type", "content_type").lower()
         if not mime.startswith("image/"):
             mime = MIME_BY_SUFFIX.get(path.suffix.lower(), "image/png")

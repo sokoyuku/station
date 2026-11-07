@@ -10,7 +10,9 @@ import tomllib
 from pathlib import Path
 
 from .station import Station
+from station import logger
 from station.errors import ExternalError
+from station.timeouts import http_timeout
 from station.prototypes.boundary import ext_bool, ext_dict, ext_float, ext_int, ext_list, ext_str
 
 def _get_env(key: str) -> str | None:
@@ -199,19 +201,19 @@ async def _post_station_admin(
     payload: dict,
     headers: dict,
 ) -> tuple[int, dict | None, str]:
-    async with aiohttp.ClientSession(trust_env=False) as direct:
-        async with direct.post(url, json=payload, headers=headers) as resp:
+    timeout = http_timeout()
+    async with aiohttp.ClientSession(timeout=timeout, trust_env=False) as direct:
+        async with direct.post(url, json=payload, headers=headers, timeout=timeout) as resp:
             raw = await resp.text()
             body: dict | None = None
             if raw.strip():
                 try:
                     parsed = json.loads(raw)
-                except json.JSONDecodeError:
-                    parsed = None
-                try:
-                    body = ext_dict("body", parsed)
-                except ExternalError:
-                    body = None
+                except json.JSONDecodeError as exc:
+                    raise ExternalError(
+                        "admin response is not JSON status=%s error=%s body=%s" % (resp.status, exc, raw[:300])
+                    ) from exc
+                body = ext_dict("body", parsed)
             return resp.status, body, raw
 
 def _raise_admin_error(route: str, status: int, body: dict | None, raw: str) -> None:
@@ -248,8 +250,9 @@ async def _admin_update_station_token(
     status, body, raw = await _post_station_admin(url, payload=payload, headers=headers)
     try:
         body = ext_dict("body", body)
-    except ExternalError:
-        body = None
+    except ExternalError as exc:
+        logger.error("admin/prototype_token body invalid error=%s", exc)
+        _raise_admin_error("admin/prototype_token", status, None, raw)
     if status != 200 or body is None or body.get("result") != 0:
         _raise_admin_error("admin/prototype_token", status, body, raw)
 
@@ -292,14 +295,17 @@ async def _admin_attach_prototype(
     status, body, raw = await _post_station_admin(url, payload=payload, headers=headers)
     try:
         body = ext_dict("body", body)
-    except ExternalError:
-        body = None
+    except ExternalError as exc:
+        logger.error("admin/prototype body invalid error=%s", exc)
+        _raise_admin_error("admin/prototype", status, None, raw)
     if status != 200 or body is None or body.get("result") != 0:
         _raise_admin_error("admin/prototype", status, body, raw)
     data = body.get("data")
     if data is None:
         return {}
     return ext_dict("admin/prototype data", data)
+
+_CONSUL_TIMEOUT = aiohttp.ClientTimeout(total=30, connect=10, sock_connect=10, sock_read=30)
 
 async def _sign_in(*, session: aiohttp.ClientSession, consul_url: str, username: str, password: str) -> None:
     url = f"{consul_url.rstrip('/')}/api/sign_in"
@@ -308,7 +314,7 @@ async def _sign_in(*, session: aiohttp.ClientSession, consul_url: str, username:
         "username": username or "",
         "email": "",
         "password": password or "",
-    }) as resp:
+    }, timeout=_CONSUL_TIMEOUT) as resp:
         body = ext_dict("sign_in body", await resp.json(content_type=None))
         if resp.status != 200 or body.get("result") != 0:
             raise RuntimeError(body.get("msg") or f"sign_in failed (status={resp.status})")
@@ -350,7 +356,7 @@ def _complete_ensure_prototype_payload(payload: dict) -> dict:
         call_support = False
     else:
         call_support = ext_bool("call_support", call_support)
-    return {
+    out = {
         "name": _optional_str_field(src, "name", ""),
         "description": _optional_str_field(src, "description", ""),
         "access_point": _optional_str_field(src, "access_point", ""),
@@ -367,11 +373,21 @@ def _complete_ensure_prototype_payload(payload: dict) -> dict:
         "privacy_policy": _optional_str_field(src, "privacy_policy", ""),
         "call_support": call_support,
     }
+    if "max_models" in src:
+        raw_cap = src.get("max_models")
+        if raw_cap is None:
+            out["max_models"] = None
+        else:
+            cap = ext_int("max_models", raw_cap)
+            if cap < 0:
+                raise ExternalError("max_models cannot be negative")
+            out["max_models"] = cap
+    return out
 
 async def _ensure_prototype(*, session: aiohttp.ClientSession, consul_url: str, payload: dict) -> dict:
     url = f"{consul_url.rstrip('/')}/api/ensure_prototype"
     payload = _complete_ensure_prototype_payload(payload)
-    async with session.post(url, json=payload) as resp:
+    async with session.post(url, json=payload, timeout=_CONSUL_TIMEOUT) as resp:
         body = ext_dict("ensure_prototype body", await resp.json(content_type=None))
         if resp.status != 200 or body.get("result") != 0:
             raise RuntimeError(body.get("msg") or f"ensure_prototype failed (status={resp.status})")
@@ -380,10 +396,14 @@ async def _ensure_prototype(*, session: aiohttp.ClientSession, consul_url: str, 
 async def _verify_station_token(*, session: aiohttp.ClientSession, consul_url: str, token: str) -> bool:
     url = f"{consul_url.rstrip('/')}/api/station/get_prototype"
     headers = {"X-Prototype-Token": token}
-    async with session.get(url, headers=headers) as resp:
-        if resp.status != 200:
-            return False
-        body = ext_dict("get_prototype body", await resp.json(content_type=None))
+    try:
+        async with session.get(url, headers=headers, timeout=_CONSUL_TIMEOUT) as resp:
+            body = await resp.json(content_type=None)
+            if resp.status != 200:
+                raise RuntimeError("get_prototype failed status=%s body=%s" % (resp.status, body))
+    except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+        raise RuntimeError("get_prototype failed error=%s" % e) from e
+    body = ext_dict("get_prototype body", body)
     return body.get("result") == 0
 
 def _payload_from_prototype_entry(entry: dict) -> dict[str, object]:
@@ -396,6 +416,7 @@ def _payload_from_prototype_entry(entry: dict) -> dict[str, object]:
         "status": "status",
         "private": "private",
         "max_chats": "max_chats",
+        "max_models": "max_models",
         "charge": "charge",
         "is_local": "is_local",
         "billing_interval": "billing_interval",
@@ -472,7 +493,7 @@ async def sync_prototype(
     consul_username, consul_password = _require_consul_credentials(config)
 
     cookie_jar = aiohttp.CookieJar(unsafe=True)
-    async with aiohttp.ClientSession(cookie_jar=cookie_jar, trust_env=True) as session:
+    async with aiohttp.ClientSession(cookie_jar=cookie_jar, timeout=http_timeout(), trust_env=True) as session:
         await _sign_in(session=session, consul_url=consul_url, username=consul_username, password=consul_password)
 
         old_text = raw.decode("utf-8")
@@ -520,6 +541,49 @@ def _build_update_token_parser(prog_name: str) -> argparse.ArgumentParser:
     parser.add_argument("--prototype-name", dest="prototype_name", default=None)
     return parser
 
+def _build_rekey_local_parser(prog_name: str) -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog=f"{prog_name} rekey-local")
+    parser.add_argument("--config", dest="config_path", default=None)
+    parser.add_argument("--secret", dest="secret_path", default=None)
+    parser.add_argument("--consul-url", dest="consul_url", default=None)
+    parser.add_argument("--db-backend", dest="db_backend", default=None)
+    parser.add_argument("--db-dsn", dest="db_dsn", default=None)
+    parser.add_argument("--db-path", dest="db_path", default=None)
+    parser.add_argument("--old-private-key", dest="old_private_key", default=None)
+    parser.add_argument("--list", dest="list_only", action="store_true")
+    return parser
+
+def _run_rekey_local(args: argparse.Namespace) -> int:
+    from station.config.config import Config
+    from station.conductor.rekey import rekey_local_secrets
+
+    try:
+        config_path = (args.config_path or "").strip() or _get_env("STATION_CONFIG_FILE")
+        secret_path = (args.secret_path or "").strip() or None
+        config = Config(config_file=config_path, secret_file=secret_path)
+        if (args.consul_url or "").strip():
+            config.consul_url = args.consul_url.strip()
+        if (args.db_backend or "").strip():
+            config.database.backend = args.db_backend.strip().lower()
+        if (args.db_dsn or "").strip():
+            config.database.dsn = args.db_dsn.strip()
+        if (args.db_path or "").strip():
+            config.database.path = args.db_path.strip()
+        username, password = _require_consul_credentials(config.data)
+        asyncio.run(rekey_local_secrets(
+            config=config,
+            username=username,
+            password=password,
+            old_private_key_path=(args.old_private_key or "").strip(),
+            list_only=args.list_only,
+        ))
+    except (ExternalError, RuntimeError) as e:
+        raise SystemExit(str(e)) from None
+    except Exception as e:
+        logger.error("unexpected where=rekey_local error=%s", e, exc_info=e)
+        raise
+    return 0
+
 def _build_attach_prototype_parser(prog_name: str) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog=f"{prog_name} attach-prototype")
     parser.add_argument("--station-url", dest="station_url", required=True)
@@ -544,6 +608,7 @@ def _build_attach_prototype_parser(prog_name: str) -> argparse.ArgumentParser:
     parser.add_argument("--status", dest="status", default=None)
     parser.add_argument("--private", dest="private", type=_parse_bool, default=None)
     parser.add_argument("--max-chats", dest="max_chats", type=int, default=None)
+    parser.add_argument("--max-models", dest="max_models", type=int, default=None)
     parser.add_argument("--charge", dest="charge", type=int, default=None)
     parser.add_argument("--is-local", dest="is_local", type=_parse_bool, default=None)
     return parser
@@ -560,7 +625,7 @@ def _run_update_token(args: argparse.Namespace) -> int:
 
     async def run_update():
         cookie_jar = aiohttp.CookieJar(unsafe=True)
-        async with aiohttp.ClientSession(cookie_jar=cookie_jar, trust_env=True) as session:
+        async with aiohttp.ClientSession(cookie_jar=cookie_jar, timeout=http_timeout(), trust_env=True) as session:
             new_token = (args.prototype_token or "").strip()
 
             if new_token:
@@ -622,8 +687,8 @@ def _run_update_token(args: argparse.Namespace) -> int:
                     try:
                         if raw_id is not None and ext_int("id", raw_id) == want_id:
                             filtered.append(e)
-                    except ExternalError:
-                        pass
+                    except ExternalError as exc:
+                        logger.error("prototype id invalid error=%s", exc)
                 named = filtered
                 if not named:
                     raise RuntimeError(
@@ -688,7 +753,7 @@ def _run_attach_prototype(args: argparse.Namespace) -> int:
 
     async def run_attach():
         cookie_jar = aiohttp.CookieJar(unsafe=True)
-        async with aiohttp.ClientSession(cookie_jar=cookie_jar, trust_env=True) as session:
+        async with aiohttp.ClientSession(cookie_jar=cookie_jar, timeout=http_timeout(), trust_env=True) as session:
             prototype_id = args.prototype_id
             token = (args.prototype_token or "").strip()
             name = (args.prototype_name or "").strip() or None
@@ -722,6 +787,7 @@ def _run_attach_prototype(args: argparse.Namespace) -> int:
                     "status": args.status,
                     "private": args.private,
                     "max_chats": args.max_chats,
+                    "max_models": args.max_models,
                     "charge": args.charge,
                     "is_local": args.is_local,
                 }.items():
@@ -797,6 +863,7 @@ def _build_run_parser(prog_name: str) -> argparse.ArgumentParser:
     parser.add_argument("--status", dest="status")
     parser.add_argument("--private", dest="private", type=_parse_bool)
     parser.add_argument("--max-chats", dest="max_chats", type=int)
+    parser.add_argument("--max-models", dest="max_models", type=int)
     parser.add_argument("--charge", dest="charge", type=int)
     parser.add_argument("--is-local", dest="is_local", type=_parse_bool)
     return parser
@@ -844,6 +911,9 @@ def run_cli(
     if args_list and args_list[0] in ("attach-prototype", "attach_prototype"):
         parser = _build_attach_prototype_parser(prog_name)
         return _run_attach_prototype(parser.parse_args(args_list[1:]))
+    if args_list and args_list[0] in ("rekey-local", "rekey_local"):
+        parser = _build_rekey_local_parser(prog_name)
+        return _run_rekey_local(parser.parse_args(args_list[1:]))
 
     parser = _build_run_parser(prog_name)
     args = parser.parse_args(args_list)
@@ -861,6 +931,7 @@ def run_cli(
             "status": args.status,
             "private": args.private,
             "max_chats": args.max_chats,
+            "max_models": args.max_models,
             "charge": args.charge,
             "is_local": args.is_local,
         }

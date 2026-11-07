@@ -3,6 +3,7 @@ from dataclasses import dataclass, field
 from station import logger
 from station.prototypes.boundary import ext_dict, ext_str
 from station.prototypes.bridge_worker import PrototypeBridgeWorker
+from station.timeouts import TURN_TIMEOUT_S, wait
 
 @dataclass(slots=True)
 class PendingTurnMessage:
@@ -13,6 +14,12 @@ class PendingTurnMessage:
 class PiWorker(PrototypeBridgeWorker):
     def _bridge_worker_error_text(self, error):
         return "Pi bridge error: %s" % error
+
+    async def _interrupt_backend(self, *, session_id, chat_id, acct_id):
+        gateway = self._gateway
+        if gateway is None:
+            return
+        await gateway.kill_chat(acct_id=acct_id, chat_id=chat_id)
 
     async def _drop_backend_session(self, *, session_id, chat_id, acct_id):
         gateway = self._gateway
@@ -36,14 +43,16 @@ class PiWorker(PrototypeBridgeWorker):
                         await rpc.prompt(message, images=images, streaming_behavior="steer")
                     else:
                         await rpc.steer(message)
-                except Exception:
-                    logger.info(
-                        "Pi steer failed; queueing follow-up model_id=%s acct_id=%s chat_id=%s",
+                except Exception as exc:
+                    logger.error(
+                        "Pi steer failed model_id=%s acct_id=%s chat_id=%s error=%s",
                         self.model_id,
                         acct_id,
                         chat_id,
-                        exc_info=True,
+                        exc,
+                        exc_info=exc,
                     )
+                    raise
                 else:
                     return
 
@@ -104,7 +113,7 @@ class PiWorker(PrototypeBridgeWorker):
         extra_lines = []
 
         while True:
-            event = ext_dict("pi event", await queue.get())
+            event = ext_dict("pi event", await wait(queue.get(), TURN_TIMEOUT_S, "pi events"))
             event_type = ext_str("pi event.type", event.get("type"))
             if event_type == "extension_error":
                 err = event.get("error")

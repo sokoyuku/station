@@ -7,6 +7,7 @@ from station.errors import ExternalError
 from station.prototypes.boundary import ext_dict, ext_str
 from station.prototypes.gateway_process import SessionEvent, SessionEventBus, gateway_subprocess_kwargs
 from station.prototypes.jsonrpc_process import JsonLineRpcProcess
+from station.timeouts import TURN_TIMEOUT_S
 
 
 def hermes_child_env(settings, hermes_home, env=None):
@@ -128,7 +129,7 @@ class HermesGatewayProcess(JsonLineRpcProcess):
         params.update(payload)
         await self.request(method, params)
 
-    async def request(self, method, params, *, timeout_s=None):
+    async def request(self, method, params, *, timeout_s=TURN_TIMEOUT_S):
         if self.proc is None or self.proc.returncode is not None or self.proc.stdin is None:
             raise RuntimeError("Hermes gateway is not running")
         return await self._request_future(
@@ -144,7 +145,8 @@ class HermesGatewayProcess(JsonLineRpcProcess):
             try:
                 await self._handle_stdout_frame(frame)
             except (TypeError, RuntimeError) as e:
-                logger.warning("Hermes gateway frame rejected: %s raw=%s", e, frame)
+                logger.error("Hermes gateway frame rejected error=%s raw=%s", e, frame)
+                raise
 
         def on_close():
             self._ready.set()

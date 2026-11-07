@@ -1,4 +1,4 @@
-BASIC_COMMANDS = {"/help", "/restart", "/reset"}
+BASIC_COMMANDS = {"/help", "/start", "/restart", "/reset", "/stop"}
 
 
 class PrototypeCommands:
@@ -16,6 +16,7 @@ class PrototypeCommands:
             ("/help", "Show commands"),
             ("/start", "Start"),
             ("/restart", "Clear this chat and start fresh"),
+            ("/stop", "Force-stop the model for this chat"),
         ]
         if self._has_model_config():
             items.extend(
@@ -31,6 +32,19 @@ class PrototypeCommands:
         items.extend(self._kind_help_commands())
         return items
 
+    def _station_slash_commands(self):
+        names = set(BASIC_COMMANDS)
+        if self._has_model_config():
+            names.update({"/key", "/model", "/provider", "/base_url", "/config", "/settings"})
+        for cmd, _desc in self._kind_help_commands():
+            token = (cmd or "").split(None, 1)[0].split("@", 1)[0].lower()
+            if token:
+                names.add(token)
+        return names
+
+    def _owns_station_command(self, cmd):
+        return (cmd or "").lower() in self._station_slash_commands()
+
     def _help_text(self):
         seen = set()
         lines = ["Commands:"]
@@ -40,6 +54,18 @@ class PrototypeCommands:
             seen.add(cmd)
             lines.append("%s - %s" % (cmd, desc))
         return "\n".join(lines)
+
+    async def _send_help(self, *, chat_id, acct_id, reply_to="", platform="", chat_type=""):
+        await self.send_outbound(
+            text=self._help_text(),
+            chat_id=chat_id,
+            acct_id=acct_id,
+            reply_to=reply_to,
+            platform=platform,
+            chat_type=chat_type)
+
+    async def _stop_chat(self, *, chat_id, acct_id):
+        return
 
     async def _handle_basic_command(
         self,
@@ -55,7 +81,26 @@ class PrototypeCommands:
     ):
         if cmd not in BASIC_COMMANDS:
             return False
+        if cmd == "/start":
+            await self.send_outbound(
+                text="hi",
+                chat_id=chat_id,
+                acct_id=acct_id,
+                reply_to=reply_to,
+                platform=platform,
+                chat_type=chat_type)
+            return True
+        if cmd == "/stop":
+            await self._stop_chat(chat_id=chat_id, acct_id=acct_id)
+            await self.send_outbound(
+                text="Stopped.",
+                chat_id=chat_id,
+                acct_id=acct_id,
+                platform=platform,
+                chat_type=chat_type)
+            return True
         if cmd in {"/restart", "/reset"}:
+            await self._stop_chat(chat_id=chat_id, acct_id=acct_id)
             await self._restart_chat(chat_id=chat_id, acct_id=acct_id)
             await self.send_outbound(
                 text="Chat restarted." if cmd == "/restart" else "reset completed",
@@ -64,8 +109,7 @@ class PrototypeCommands:
                 platform=platform,
                 chat_type=chat_type)
             return True
-        await self.send_outbound(
-            text=self._help_text(),
+        await self._send_help(
             chat_id=chat_id,
             acct_id=acct_id,
             reply_to=reply_to,

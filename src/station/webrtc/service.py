@@ -4,6 +4,7 @@ import time
 from station import logger
 from station.errors import ExternalError
 from station.prototypes.boundary import ext_dict, ext_int, ext_list, ext_str
+from station.timeouts import BoundedLock
 
 def _frame_to_s16le_mono_48k(frame, audioop):
     import numpy as np
@@ -47,7 +48,7 @@ class WebRTCService:
         self._Fraction = None
         self._audioop = None
         self._np = None
-        self._pc_lock = asyncio.Lock()
+        self._pc_lock = BoundedLock(where="webrtc pc")
         self._pcs = {}
 
     def _load_aiortc(self):
@@ -136,7 +137,7 @@ class WebRTCService:
                 self._pts = 0
                 self._t0 = time.time()
                 self._buf = bytearray()
-                self._lock = asyncio.Lock()
+                self._lock = BoundedLock(where="webrtc call")
 
             async def push_pcm_mono_s16le(self, pcm: bytes):
                 if not pcm:
@@ -197,7 +198,7 @@ class WebRTCService:
         parsed.sdpMLineIndex = sdp_mline_index
         return parsed
 
-    async def _register_pc(self, key, pc, *, audio_out=None, tasks=None, on_ended=None):
+    async def _register_pc(self, key, pc, *, audio_out=None, tasks=None, on_ended=None, on_audio_in=None):
         async with self._pc_lock:
             old = self._pcs.get(key)
             self._pcs[key] = {
@@ -205,10 +206,25 @@ class WebRTCService:
                 "audio_out": audio_out,
                 "tasks": list(tasks) if tasks is not None else [],
                 "on_ended": on_ended,
+                "on_audio_in": on_audio_in,
                 "ts": time.time(),
             }
         if old:
             await self._shutdown_entry(old)
+
+    async def inject_audio_pcm(self, *, call_id, pcm_s16le_mono_48k):
+        call_id = (call_id or "").strip()
+        if not call_id or not pcm_s16le_mono_48k:
+            return False
+        async with self._pc_lock:
+            entry = self._pcs.get(call_id)
+            on_audio_in = entry.get("on_audio_in") if entry else None
+        if on_audio_in is None:
+            return False
+        result = on_audio_in(pcm_s16le_mono_48k)
+        if asyncio.iscoroutine(result):
+            await result
+        return True
 
     async def _shutdown_entry(self, entry):
         on_ended = entry["on_ended"]
@@ -268,7 +284,14 @@ class WebRTCService:
         async def push_audio(pcm):
             await audio_out.push_pcm_mono_s16le(pcm)
 
-        await self._register_pc(key, pc, audio_out=audio_out, tasks=pump_tasks, on_ended=on_ended)
+        await self._register_pc(
+            key,
+            pc,
+            audio_out=audio_out,
+            tasks=pump_tasks,
+            on_ended=on_ended,
+            on_audio_in=on_audio_in,
+        )
 
         candidate_buf = []
         flush_task = None

@@ -9,12 +9,10 @@ def station_chat_type(platform, native):
         return "private"
     if platform == "discord" and native in ("group_dm", "guild_text", "voice", "forum", "thread"):
         return "group"
-    if platform == "matrix" and native == "direct":
-        return "private"
-    if platform == "matrix" and native == "room":
-        return "group"
     if platform == "qq" and native == "c2c":
         return "private"
     if platform in ("whatsapp", "whatsapp_cloud") and native in ("one-to-one", "direct"):
         return "private"
+    if platform in ("whatsapp", "whatsapp_cloud") and native in ("status", "broadcast", "newsletter"):
+        return "group"
     return ""

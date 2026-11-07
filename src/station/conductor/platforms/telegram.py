@@ -41,6 +41,24 @@ _METHOD_MEDIA_FIELD = {
     "send_sticker": "sticker",
 }
 
+_TELEGRAM_TOPIC_SERVICE_KEYS = (
+    "forum_topic_created",
+    "forum_topic_edited",
+    "forum_topic_closed",
+    "forum_topic_reopened",
+    "general_forum_topic_hidden",
+    "general_forum_topic_unhidden",
+)
+
+def telegram_topic_service_message(msg: dict) -> bool:
+    # Opening a topic sends this no-text service message, then the user's text.
+    if not msg:
+        return False
+    for key in _TELEGRAM_TOPIC_SERVICE_KEYS:
+        if msg.get(key) is not None:
+            return True
+    return False
+
 def effective_message_thread_id(msg: dict) -> str:
     msg = ext_dict('telegram message', msg)
     chat = msg.get("chat")
@@ -215,6 +233,70 @@ class TelegramUpdate:
     sender_username: str = ""
 
 
+def _utf16_slice(text, offset, length):
+    if length <= 0 or offset < 0:
+        return ""
+    encoded = text.encode("utf-16-le")
+    start = offset * 2
+    end = (offset + length) * 2
+    if end > len(encoded):
+        return ""
+    return encoded[start:end].decode("utf-16-le")
+
+
+def telegram_message_mentions_bot(msg, bot_username=""):
+    if not msg:
+        return False
+    bot_username = (bot_username or "").strip().lstrip("@")
+    text = ext_str(msg.get("text"), "text")
+    caption = ext_str(msg.get("caption"), "caption")
+    if _telegram_entities_mention_bot(text, msg.get("entities"), bot_username):
+        return True
+    if _telegram_entities_mention_bot(caption, msg.get("caption_entities"), bot_username):
+        return True
+    if bot_username:
+        needle = "@" + bot_username.lower()
+        if needle in text.lower() or needle in caption.lower():
+            return True
+    rt = msg.get("reply_to_message")
+    if rt is not None:
+        rt = ext_dict("telegram reply_to_message", rt)
+        sender = rt.get("from")
+        if sender is not None:
+            sender = ext_dict("telegram reply from", sender)
+            reply_username = ext_str(sender.get("username"), "username").strip()
+            if bot_username and reply_username.lower() == bot_username.lower():
+                return True
+            if not bot_username and bool(sender.get("is_bot")):
+                return True
+    return False
+
+
+def _telegram_entities_mention_bot(text, entities, bot_username):
+    if not bot_username or entities is None:
+        return False
+    entities = ext_list("telegram entities", entities)
+    for item in entities:
+        item = ext_dict("telegram entity", item)
+        kind = ext_str(item.get("type"), "type").strip().lower()
+        if kind == "mention":
+            offset = ext_int(item.get("offset"), "offset")
+            length = ext_int(item.get("length"), "length")
+            token = _utf16_slice(text, offset, length).strip().lstrip("@")
+            if token.lower() == bot_username.lower():
+                return True
+            continue
+        if kind == "text_mention":
+            user = item.get("user")
+            if user is None:
+                continue
+            user = ext_dict("telegram entity user", user)
+            username = ext_str(user.get("username"), "username").strip()
+            if username.lower() == bot_username.lower():
+                return True
+    return False
+
+
 def _telegram_person_sender(sender):
     first = ext_str(sender.get("first_name"), "first_name").strip()
     last = ext_str(sender.get("last_name"), "last_name").strip()
@@ -316,6 +398,8 @@ class TelegramIO:
         if chat_id is None:
             return None
         if ext_str(chat.get("type"), "type").strip().lower() == "channel":
+            return None
+        if telegram_topic_service_message(msg):
             return None
         chat_id_str = platform_chat_id_for_message(ext_id(chat_id, "chat.id", allow_none=False), effective_message_thread_id(msg))
         chat_type = ext_str(chat.get("type"), "type").strip()
@@ -707,10 +791,17 @@ class TelegramIO:
         async with self.session.get(dl_url) as resp:
             if resp.status != 200:
                 return None
-            data = await resp.content.read(limit + 1)
-            if len(data) > limit:
-                return None
-            return data
+            chunks = []
+            total = 0
+            while True:
+                block = await resp.content.readany()
+                if not block:
+                    break
+                total += len(block)
+                if total > limit:
+                    return None
+                chunks.append(block)
+            return b"".join(chunks)
 
     async def group_message_notice(self, *, token: str) -> str:
         token = (token or "").strip()
@@ -900,8 +991,13 @@ class TelegramIO:
                     plain_payload.update(self._reply_to_payload(reply_to))
                     if markup is not None:
                         plain_payload["reply_markup"] = markup
-                ok, _ = await self._send(token=token, method="send_message", payload=plain_payload)
+                ok, desc = await self._send(token=token, method="send_message", payload=plain_payload)
             if not ok:
+                logger.warning(
+                    "telegram send_message failed chat_id=%s description=%s",
+                    api_chat_id,
+                    desc,
+                )
                 return False
             last_ok = True
         return last_ok
@@ -936,14 +1032,20 @@ class TelegramIO:
     ) -> bool:
         method = guidance.resolve_telegram_media_method(method, filename or "")
         if method == "send_voice" and file_bytes is not None:
-            from station.prototypes.voice_policy import is_ogg_opus_audio, transcode_audio_to_ogg_opus
+            from station.prototypes.voice_policy import ffmpeg_path, is_ogg_opus_audio, transcode_audio_to_ogg_opus
 
             if not is_ogg_opus_audio(file_bytes):
-                converted = transcode_audio_to_ogg_opus(file_bytes)
-                if converted:
-                    file_bytes = converted
+                if ffmpeg_path():
+                    converted = transcode_audio_to_ogg_opus(file_bytes)
+                    if converted:
+                        file_bytes = converted
+                        stem = (filename or "voice").rsplit(".", 1)[0] or "voice"
+                        filename = stem + ".ogg"
+                else:
+                    logger.warning("ffmpeg missing; sending voice as audio")
+                    method = "send_audio"
                     stem = (filename or "voice").rsplit(".", 1)[0] or "voice"
-                    filename = stem + ".ogg"
+                    filename = stem + ".mp3"
         field = _METHOD_MEDIA_FIELD.get(method)
         if not field:
             return False
@@ -1070,6 +1172,17 @@ class TelegramIO:
             body["chat_type"] = parsed.chat_type
         if parsed.is_edit:
             body["is_edit"] = True
+        bot_username = ""
+        acct = await self.conductor.db.get_local_account(acct_id)
+        if acct:
+            bot_username = ext_str(acct.get("username") or acct.get("acct_username"), "username").strip()
+        msg = update.get("message")
+        if msg is None:
+            msg = update.get("edited_message")
+        if msg is not None:
+            body["mentioned"] = telegram_message_mentions_bot(ext_dict("telegram message", msg), bot_username)
+        else:
+            body["mentioned"] = bool(parsed.callback_query_id)
         if not parsed.text and not parsed.caption and not parsed.attachments:
             body["raw"] = update
         ok = await self.conductor.deliver_inbound(

@@ -120,8 +120,7 @@ def merge_fill(base, extra):
             elif _empty_setting(existing):
                 out[key] = merge_fill({}, value)
             continue
-        if _empty_setting(existing):
-            out[key] = value
+        out[key] = value
     return out
 
 def merge_launch_settings(model_settings, *, config_file=None, secret_file=None, overlay=None):

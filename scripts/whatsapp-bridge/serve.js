@@ -116,6 +116,81 @@ function replyToFromMessage(message) {
   return "";
 }
 
+function normalizeWhatsAppId(value) {
+  if (!value) return "";
+  return String(value).replace(":", "@");
+}
+
+function whatsappIdKeys(value) {
+  const normalized = normalizeWhatsAppId(value);
+  if (!normalized) return [];
+  const local = normalized.split("@")[0].split(":")[0];
+  return [normalized, normalized.toLowerCase(), local, local.toLowerCase()].filter(Boolean);
+}
+
+function whatsappIdsOverlap(left, right) {
+  const rightKeys = new Set(whatsappIdKeys(right));
+  if (!rightKeys.size) return false;
+  return whatsappIdKeys(left).some((key) => rightKeys.has(key));
+}
+
+function messageContent(message) {
+  const content = message || {};
+  if (content.ephemeralMessage?.message) return content.ephemeralMessage.message;
+  if (content.viewOnceMessage?.message) return content.viewOnceMessage.message;
+  if (content.viewOnceMessageV2?.message) return content.viewOnceMessageV2.message;
+  if (content.documentWithCaptionMessage?.message) return content.documentWithCaptionMessage.message;
+  return content;
+}
+
+function contextInfoFromMessage(message) {
+  const content = messageContent(message);
+  if (content?.contextInfo) return content.contextInfo;
+  for (const value of Object.values(content || {})) {
+    if (value && typeof value === "object" && value.contextInfo) {
+      return value.contextInfo;
+    }
+  }
+  return {};
+}
+
+function inboundChatId(remote) {
+  const raw = String(remote || "").trim();
+  const lower = raw.toLowerCase();
+  if (lower.endsWith("@g.us") || lower.endsWith("@broadcast") || lower.endsWith("@newsletter")) {
+    return raw;
+  }
+  return raw.split("@")[0];
+}
+
+function inboundChatType(remote) {
+  const lower = String(remote || "").trim().toLowerCase();
+  if (lower.endsWith("@g.us") || lower.endsWith("@broadcast") || lower.endsWith("@newsletter") || lower === "status@broadcast") {
+    return "group";
+  }
+  return "private";
+}
+
+function isBroadcastChat(remote) {
+  const cid = String(remote || "").trim().toLowerCase();
+  return cid === "status@broadcast" || cid.endsWith("@broadcast") || cid.endsWith("@newsletter");
+}
+
+function mentionsBot({ text, mentionedIds, quotedParticipant, botIds, broadcast }) {
+  if (broadcast) return false;
+  const body = String(text || "");
+  if (/(^|\s)@all\b/i.test(body)) return true;
+  for (const botId of botIds || []) {
+    for (const mentioned of mentionedIds || []) {
+      if (whatsappIdsOverlap(botId, mentioned)) return true;
+    }
+    if (quotedParticipant && whatsappIdsOverlap(botId, quotedParticipant)) return true;
+    const bare = normalizeWhatsAppId(botId).split("@")[0].split(":")[0];
+    if (bare && body.toLowerCase().includes("@" + bare.toLowerCase())) return true;
+  }
+  return false;
+}
+
 async function connect() {
   const { state, saveCreds } = await useMultiFileAuthState(SESSION_DIR);
   const version = await resolveWhatsAppVersion();
@@ -167,10 +242,20 @@ async function connect() {
           mediaId = "";
         }
       }
+      const ctx = contextInfoFromMessage(msg.message);
+      const mentionedIds = Array.from(
+        new Set((ctx.mentionedJid || []).map(normalizeWhatsAppId).filter(Boolean))
+      );
+      const quotedParticipant = normalizeWhatsAppId(ctx.participant || "");
+      const botIds = Array.from(
+        new Set([normalizeWhatsAppId(sock?.user?.id), normalizeWhatsAppId(sock?.user?.lid)].filter(Boolean))
+      );
+      const bodyText = String(text || media?.caption || "");
+      const broadcast = isBroadcastChat(remote);
       inbox.push({
-        chat_id: remote.split("@")[0],
+        chat_id: inboundChatId(remote),
         user_id: participant.split(":")[0].split("@")[0],
-        text: String(text || media?.caption || ""),
+        text: bodyText,
         caption: String(media?.caption || ""),
         message_id: messageId,
         media_id: mediaId,
@@ -178,6 +263,14 @@ async function connect() {
         filename: media ? media.filename : "",
         mime: media ? media.mime : "",
         reply_to: replyToFromMessage(msg.message),
+        chat_type: inboundChatType(remote),
+        mentioned: mentionsBot({
+          text: bodyText,
+          mentionedIds,
+          quotedParticipant,
+          botIds,
+          broadcast,
+        }),
         ts_ms: Number(msg.messageTimestamp || 0) * 1000 || Date.now(),
       });
     }

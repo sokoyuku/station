@@ -1,15 +1,13 @@
 import asyncio
-from typing import Any
 
 from aiohttp import web
 
 from station.api.http import read_json_object
 from station.conductor.crypto import decrypt_if_encrypted
-from station.conductor.platforms.guidance import prepare_matrix_media_caption, prepare_outbound_caption
+from station.conductor.platforms.guidance import prepare_outbound_caption
 from station.conductor.platforms.policy import media_ref_action
 from station.conductor.platforms.base import LocalPlatformAdapter
 from station.conductor.platforms.discord import DiscordIO
-from station.conductor.platforms.matrix import MatrixIO
 from station.conductor.platforms.qq import QQIO
 from station.conductor.platforms.telegram import TelegramIO
 from station.conductor.platforms.whatsapp import WhatsAppAdapter
@@ -255,136 +253,6 @@ class DiscordAdapter(LocalPlatformAdapter):
     async def poller_loop(self, acct_id: str) -> None:
         await self.io.poller_loop(acct_id)
 
-class MatrixAdapter(LocalPlatformAdapter):
-    acct_type = "matrix"
-    capabilities = frozenset(
-        {"send_typing", "download_file", "send_message", "send_media", "send_webrtc"}
-    )
-
-    def __init__(self, conductor) -> None:
-        self.conductor = conductor
-        self.io = MatrixIO(conductor)
-
-    def _homeserver(self, acct: dict) -> str:
-        return _plaintext_server(self.conductor, acct)
-
-    async def send_typing(self, *, acct: dict, token: str, chat_id: str) -> bool:
-        return await self.io.send_typing(
-            acct_id=acct.get("acct_id") or "",
-            homeserver=self._homeserver(acct),
-            access_token=token,
-            room_id=chat_id,
-        )
-
-    async def download_file(self, *, acct: dict, token: str, file_id: str) -> bytes | None:
-        return await self.io.download_mxc(
-            acct_id=acct.get("acct_id") or "",
-            homeserver=self._homeserver(acct),
-            access_token=token,
-            mxc=file_id,
-        )
-
-    async def send_message(
-        self,
-        *,
-        acct: dict,
-        token: str,
-        chat_id: str,
-        text: str,
-        reply_to: str | None = None,
-        keyboard=None,
-    ) -> bool:
-        return await self.io.send_message(
-            acct_id=acct.get("acct_id") or "",
-            homeserver=self._homeserver(acct),
-            access_token=token,
-            room_id=chat_id,
-            text=text,
-            reply_to=reply_to,
-            keyboard=keyboard,
-        )
-
-    async def send_media(
-        self,
-        *,
-        acct: dict,
-        token: str,
-        chat_id: str,
-        method: str,
-        payload: dict,
-        file_bytes: bytes | None,
-        caption: str,
-        reply_to: str | None,
-    ) -> bool:
-        msgtype = "m.file"
-        if method == "send_photo":
-            msgtype = "m.image"
-        elif method == "send_video":
-            msgtype = "m.video"
-        elif method in ("send_audio", "send_voice"):
-            msgtype = "m.audio"
-        name = payload.get("file_name") or "file"
-        acct_id = acct.get("acct_id") or ""
-        homeserver = self._homeserver(acct)
-        if file_bytes is None:
-            ref = _media_ref_from_payload(payload)
-            if media_ref_action("matrix", ref) != "reuse":
-                return False
-            body, html = prepare_matrix_media_caption(caption or "", name)
-            msg_content: dict[str, Any] = {"msgtype": msgtype, "body": body, "url": ref}
-            if html:
-                msg_content["format"] = "org.matrix.custom.html"
-                msg_content["formatted_body"] = html
-            if method == "send_voice":
-                msg_content["org.matrix.msc3245.voice"] = {}
-            if reply_to:
-                msg_content["m.relates_to"] = {"m.in_reply_to": {"event_id": reply_to.strip()}}
-            return await self.io.send_event(
-                acct_id=acct_id,
-                homeserver=homeserver,
-                access_token=token,
-                room_id=chat_id,
-                event_type="m.room.message",
-                content=msg_content,
-            )
-        return await self.io.send_media_message(
-            acct_id=acct_id,
-            homeserver=homeserver,
-            access_token=token,
-            room_id=chat_id,
-            msgtype=msgtype,
-            file_bytes=file_bytes,
-            filename=name,
-            content_type=(payload.get("content_type") or "") or None,
-            caption=caption or "",
-            is_voice=method == "send_voice",
-            reply_to=reply_to,
-        )
-
-    async def send_webrtc(
-        self,
-        *,
-        acct: dict,
-        token: str,
-        chat_id: str,
-        webrtc_type: str,
-        content: dict,
-    ) -> bool:
-        return await self.io.send_event(
-            acct_id=acct.get("acct_id") or "",
-            homeserver=self._homeserver(acct),
-            access_token=token,
-            room_id=chat_id,
-            event_type=webrtc_type,
-            content=content,
-        )
-
-    async def poller_loop(self, acct_id: str) -> None:
-        await self.io.poller_loop(acct_id)
-
-    async def close(self) -> None:
-        await self.io.close()
-
 class QQAdapter(LocalPlatformAdapter):
     acct_type = "qq"
     checks_group_message_settings = True
@@ -470,7 +338,6 @@ def build_builtin_platforms(conductor) -> dict[str, LocalPlatformAdapter]:
     platforms: list[LocalPlatformAdapter] = [
         TelegramAdapter(conductor),
         DiscordAdapter(conductor),
-        MatrixAdapter(conductor),
         QQAdapter(conductor),
         WhatsAppAdapter(conductor),
         WhatsAppCloudAdapter(conductor),

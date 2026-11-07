@@ -1,6 +1,7 @@
 import asyncio
 
 from station import logger
+from station.timeouts import LONG_IO_TIMEOUT_S, wait
 from station.prototypes.device_auth import PrototypeDeviceAuth, format_device_login_start
 
 from . import auth_store
@@ -32,17 +33,25 @@ class GrokAuthFlow(PrototypeDeviceAuth):
         if creds is None:
             return None
         try:
-            return await asyncio.to_thread(ensure_fresh_credentials, creds)
+            return await wait(
+                asyncio.to_thread(ensure_fresh_credentials, creds),
+                LONG_IO_TIMEOUT_S,
+                "grok oauth refresh",
+            )
         except (OSError, RuntimeError, TypeError, ValueError) as e:
             logger.error("Grok OAuth refresh failed acct_id=%s error=%s", acct_id, e)
-            return None
+            raise
 
     async def _start_login(self, *, acct_id, chat_id="", reply_to=None, platform="", chat_type=""):
         async def begin():
-            return await asyncio.to_thread(begin_device_login)
+            return await wait(asyncio.to_thread(begin_device_login), LONG_IO_TIMEOUT_S, "grok device login")
 
         async def poll(pending):
-            return await asyncio.to_thread(poll_device_code_token, pending)
+            return await wait(
+                asyncio.to_thread(poll_device_code_token, pending),
+                LONG_IO_TIMEOUT_S,
+                "grok device poll",
+            )
 
         async def on_success(creds):
             auth_store.save_credentials(self.storage_dir, acct_id, creds)

@@ -1,11 +1,10 @@
 import aiohttp
+import asyncio
 
 from station import logger
 from station.prototypes.boundary import ext_str
 from station.prototypes.device_auth import PrototypeDeviceAuth, local_llm_auth_reply
 from station.prototypes.model_config import SECRET_DELETE_HINT
-
-from .config import OPENCODE_LOCAL_PROVIDER
 
 XAI_PROVIDER_ID = "xai"
 OAUTH_ERRORS = (aiohttp.ClientError, OSError, RuntimeError, TypeError)
@@ -32,7 +31,7 @@ class OpenCodeAuthFlow(PrototypeDeviceAuth):
         if cmd == "/logout":
             await self._cancel_device_auth(acct_id=acct_id)
             gateway = await self._ensure_gateway()
-            await gateway.auth_remove(provider_id=XAI_PROVIDER_ID)
+            await gateway.remove_integration_credentials(XAI_PROVIDER_ID)
             self._applied_provider_auth = ""
             logger.info("OpenCode xAI auth removed acct_id=%s", acct_id)
             await self.send_outbound(
@@ -61,9 +60,6 @@ class OpenCodeAuthFlow(PrototypeDeviceAuth):
     async def _ensure_provider_auth(self, *, acct_id, chat_id, reply_to=None, platform="", chat_type=""):
         settings = self._launch_settings()
         if settings.uses_local_llm():
-            gateway = await self._ensure_gateway()
-            key = settings.local_llm_api_key or settings.api_key or "local"
-            await self._apply_provider_api_key(gateway, settings.gateway_provider() or OPENCODE_LOCAL_PROVIDER, key)
             return True
         return await self._ensure_xai_auth(
             acct_id=acct_id,
@@ -81,7 +77,7 @@ class OpenCodeAuthFlow(PrototypeDeviceAuth):
         if settings.api_key:
             await self._apply_xai_api_key(gateway, settings.api_key)
             return True
-        if await gateway.provider_connected(XAI_PROVIDER_ID):
+        if await gateway.integration_connected(XAI_PROVIDER_ID):
             return True
         state = await self._get_auth_state(acct_id)
         async with state.guard:
@@ -115,11 +111,23 @@ class OpenCodeAuthFlow(PrototypeDeviceAuth):
         marker = "%s:api:%s" % (provider_id, api_key)
         if self._applied_provider_auth == marker:
             return
-        await gateway.auth_set(provider_id=provider_id, body={"type": "api", "key": api_key})
+        await gateway.connect_key(integration_id=provider_id, key=api_key)
         self._applied_provider_auth = marker
 
     async def _apply_xai_api_key(self, gateway, api_key):
         await self._apply_provider_api_key(gateway, XAI_PROVIDER_ID, api_key)
+
+    async def _capture_oauth_code(self, *, acct_id, text):
+        text = text.strip()
+        if not text or text.startswith("/"):
+            return False
+        state = await self._get_auth_state(acct_id)
+        async with state.guard:
+            pending = state.pending
+            if pending is None or pending.get("method") != "code":
+                return False
+            state.extra["code"] = text
+        return True
 
     async def _start_login(self, *, acct_id, chat_id="", reply_to=None, platform="", chat_type=""):
         gateway_holder = {}
@@ -127,20 +135,39 @@ class OpenCodeAuthFlow(PrototypeDeviceAuth):
         async def begin():
             gateway = await self._ensure_gateway()
             gateway_holder["gateway"] = gateway
-            method_index = await gateway.resolve_oauth_method_index(provider_id=XAI_PROVIDER_ID)
-            auth = await gateway.oauth_authorize(provider_id=XAI_PROVIDER_ID, method=method_index)
+            method_id = await gateway.oauth_method_id(XAI_PROVIDER_ID)
+            attempt = await gateway.oauth_begin(integration_id=XAI_PROVIDER_ID, method_id=method_id)
             return {
-                "method_index": method_index,
-                "url": ext_str("oauth authorize url", auth.get("url")),
-                "instructions": ext_str("oauth authorize instructions", auth.get("instructions")),
-                "method": ext_str("oauth authorize method", auth.get("method")).lower() or "auto",
+                "attempt_id": ext_str("oauth attempt id", attempt.get("attemptID")),
+                "url": ext_str("oauth authorize url", attempt.get("url")),
+                "instructions": ext_str("oauth authorize instructions", attempt.get("instructions")),
+                "method": ext_str("oauth authorize method", attempt.get("mode")).lower() or "auto",
             }
 
         async def poll(pending):
-            await gateway_holder["gateway"].oauth_callback(
-                provider_id=XAI_PROVIDER_ID,
-                method=pending["method_index"],
-            )
+            while True:
+                status = await gateway_holder["gateway"].oauth_status(
+                    integration_id=XAI_PROVIDER_ID,
+                    attempt_id=pending["attempt_id"],
+                )
+                state_name = ext_str("oauth status", status.get("status"))
+                if state_name == "complete":
+                    return status
+                if state_name == "failed":
+                    message = ext_str("oauth status message", status.get("message"))
+                    raise RuntimeError(message or "OpenCode OAuth failed")
+                if state_name == "expired":
+                    raise RuntimeError("OpenCode OAuth expired")
+                auth_state = await self._get_auth_state(acct_id)
+                async with auth_state.guard:
+                    code = auth_state.extra.pop("code", "")
+                if code and pending["method"] == "code":
+                    await gateway_holder["gateway"].oauth_complete(
+                        integration_id=XAI_PROVIDER_ID,
+                        attempt_id=pending["attempt_id"],
+                        code=code,
+                    )
+                await asyncio.sleep(1)
 
         async def on_success(_result):
             logger.info("OpenCode xAI OAuth completed acct_id=%s", acct_id)

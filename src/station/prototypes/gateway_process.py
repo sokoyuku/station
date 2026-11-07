@@ -1,8 +1,9 @@
 import asyncio
-import contextlib
 from dataclasses import dataclass
 
+from station import logger
 from station.gateway_processes import install_parent_death_signal
+from station.timeouts import PROCESS_STOP_TIMEOUT_S, DeadlineExceeded, wait
 
 @dataclass(slots=True)
 class SessionEvent:
@@ -42,18 +43,24 @@ async def close_subprocess(proc, tasks, *, terminate_timeout_s=5.0):
     if proc is not None and proc.returncode is None:
         proc.terminate()
         try:
-            await asyncio.wait_for(proc.wait(), timeout=terminate_timeout_s)
-        except asyncio.TimeoutError:
+            await wait(proc.wait(), terminate_timeout_s, "process terminate")
+        except DeadlineExceeded:
+            logger.error("process did not exit after terminate pid=%s; killing", proc.pid)
             proc.kill()
-            await proc.wait()
-        except ProcessLookupError:
-            pass
+            await wait(proc.wait(), terminate_timeout_s, "process kill")
+        except ProcessLookupError as exc:
+            logger.info("process already exited during terminate pid=%s error=%s", proc.pid, exc)
     for task in tasks:
         if task is None:
             continue
         task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await task
+        try:
+            await wait(task, PROCESS_STOP_TIMEOUT_S, "cancelled task")
+        except asyncio.CancelledError:
+            logger.info("cancelled task finished name=%s", task.get_name())
+        except DeadlineExceeded:
+            logger.error("cancelled task did not finish name=%s", task.get_name())
+            raise
 
 def gateway_subprocess_kwargs():
     return {"preexec_fn": install_parent_death_signal}

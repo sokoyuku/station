@@ -5,6 +5,7 @@ import os
 import aiohttp
 
 from station import logger
+from station.errors import ExternalError
 from station.prototypes.boundary import ext_dict, ext_mapping_get, ext_str
 from station.prototypes.launch_settings import normalize_openai_base_url
 from station.prototypes.voice import PrototypeVoice
@@ -115,8 +116,8 @@ async def transcribe_file(settings, local_path, *, filename=""):
     except asyncio.CancelledError:
         raise
     except Exception as e:
-        logger.warning("speech STT failed kind=%s error=%s", settings.kind, e)
-        return ""
+        logger.error("speech STT failed kind=%s error=%s", settings.kind, e)
+        raise ExternalError("speech STT failed kind=%s error=%s" % (settings.kind, e)) from e
 
 
 async def synthesize_text(settings, text):
@@ -134,8 +135,8 @@ async def synthesize_text(settings, text):
     except asyncio.CancelledError:
         raise
     except Exception as e:
-        logger.warning("speech TTS failed kind=%s error=%s", settings.kind, e)
-        return b"", ""
+        logger.error("speech TTS failed kind=%s error=%s", settings.kind, e)
+        raise ExternalError("speech TTS failed kind=%s error=%s" % (settings.kind, e)) from e
 
 
 async def _transcribe_openai(session, settings, audio_bytes, filename):
@@ -147,8 +148,8 @@ async def _transcribe_openai(session, settings, audio_bytes, filename):
     async with session.post(url, headers=headers, data=form) as resp:
         raw = await resp.read()
         if resp.status >= 400:
-            logger.warning("speech STT openai failed status=%s body=%r", resp.status, raw[:400])
-            return ""
+            logger.error("speech STT openai failed status=%s body=%r", resp.status, raw[:400])
+            raise ExternalError("speech STT openai failed status=%s" % resp.status)
         data = json.loads(raw.decode("utf-8"))
         data = ext_dict("stt response", data)
         return ext_str("stt text", data.get("text"), strip=False).strip()
@@ -162,8 +163,8 @@ async def _transcribe_xai(session, settings, audio_bytes, filename):
     async with session.post(url, headers=headers, data=form) as resp:
         raw = await resp.read()
         if resp.status >= 400:
-            logger.warning("speech STT xai failed status=%s body=%r", resp.status, raw[:400])
-            return ""
+            logger.error("speech STT xai failed status=%s body=%r", resp.status, raw[:400])
+            raise ExternalError("speech STT xai failed status=%s" % resp.status)
         data = json.loads(raw.decode("utf-8"))
         data = ext_dict("stt response", data)
         return ext_str("stt text", data.get("text"), strip=False).strip()
@@ -180,8 +181,8 @@ async def _transcribe_ds(session, settings, audio_bytes, filename):
     async with session.post(url, headers=headers, params=params, data=form) as resp:
         raw = await resp.read()
         if resp.status >= 400:
-            logger.warning("speech STT ds failed status=%s body=%r", resp.status, raw[:400])
-            return ""
+            logger.error("speech STT ds failed status=%s body=%r", resp.status, raw[:400])
+            raise ExternalError("speech STT ds failed status=%s" % resp.status)
         data = json.loads(raw.decode("utf-8"))
         data = ext_dict("stt response", data)
         return ext_str("stt text", data.get("text") or data.get("transcript"), strip=False).strip()
@@ -198,12 +199,12 @@ async def _synthesize_openai(session, settings, text):
     async with session.post(url, headers=headers, json=payload) as resp:
         raw = await resp.read()
         if resp.status >= 400:
-            logger.warning("speech TTS openai failed status=%s body=%r", resp.status, raw[:400])
-            return b"", ""
+            logger.error("speech TTS openai failed status=%s body=%r", resp.status, raw[:400])
+            raise ExternalError("speech TTS openai failed status=%s" % resp.status)
         content_type = (resp.headers.get("Content-Type") or "").split(";")[0].strip().lower()
-        if raw:
-            return raw, content_type or "audio/mpeg"
-        return b"", ""
+        if not raw:
+            raise ExternalError("speech TTS openai returned no audio")
+        return raw, content_type or "audio/mpeg"
 
 
 async def _synthesize_xai(session, settings, text):
@@ -219,21 +220,21 @@ async def _synthesize_xai(session, settings, text):
         raw = await resp.read()
         content_type = (resp.headers.get("Content-Type") or "").split(";")[0].strip().lower()
         if resp.status >= 400:
-            logger.warning("speech TTS xai failed status=%s body=%r", resp.status, raw[:400])
-            return b"", ""
+            logger.error("speech TTS xai failed status=%s body=%r", resp.status, raw[:400])
+            raise ExternalError("speech TTS xai failed status=%s" % resp.status)
         if "application/json" in content_type:
             data = json.loads(raw.decode("utf-8"))
             data = ext_dict("tts response", data)
             audio_b64 = ext_str("tts audio", data.get("audio"), strip=False)
             if not audio_b64:
-                return b"", ""
+                raise ExternalError("speech TTS xai returned no audio")
             import base64
 
             mime = ext_str("tts content_type", data.get("content_type"), strip=False) or "audio/mpeg"
             return base64.b64decode(audio_b64), mime
-        if raw:
-            return raw, content_type or "audio/mpeg"
-        return b"", ""
+        if not raw:
+            raise ExternalError("speech TTS xai returned no audio")
+        return raw, content_type or "audio/mpeg"
 
 
 async def _synthesize_ds(session, settings, text):
@@ -247,12 +248,12 @@ async def _synthesize_ds(session, settings, text):
     async with session.post(url, headers=headers, json=body, params={"format": "wav"}) as resp:
         raw = await resp.read()
         if resp.status >= 400:
-            logger.warning("speech TTS ds failed status=%s body=%r", resp.status, raw[:400])
-            return b"", ""
+            logger.error("speech TTS ds failed status=%s body=%r", resp.status, raw[:400])
+            raise ExternalError("speech TTS ds failed status=%s" % resp.status)
         content_type = (resp.headers.get("Content-Type") or "").split(";")[0].strip().lower()
-        if raw:
-            return raw, content_type or "audio/wav"
-        return b"", ""
+        if not raw:
+            raise ExternalError("speech TTS ds returned no audio")
+        return raw, content_type or "audio/wav"
 
 
 class PrototypeSpeech(PrototypeVoice):

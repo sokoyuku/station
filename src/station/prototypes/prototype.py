@@ -1,5 +1,5 @@
 from station.client.conductor import send_proxy, send_outbound
-from station.errors import ExternalError, InternalError
+from station.errors import ExternalError, InternalError, public_chat_error
 from station.prototypes.chat_history import clear_chat_history
 from station.prototypes.attachments import (
     PrototypeAttachments,
@@ -12,6 +12,7 @@ from station.prototypes.boundary import (
     validate_inbound_data,
     validate_inbound_message_fields,
 )
+from .cli_tools import PrototypeCli
 from .commands import PrototypeCommands
 from .echo import PrototypeEcho
 from .pfs import PrototypeFS
@@ -20,7 +21,7 @@ from .discord_voice import PrototypeDiscordVoice
 from .inbound import InboundMessageContext, PrototypeInbound
 from station import logger
 
-class Prototype(PrototypeCommands, PrototypeEcho, PrototypeWebRTC, PrototypeDiscordVoice, PrototypeAttachments, PrototypeOutboundFiles, PrototypeFS, PrototypeInbound):
+class Prototype(PrototypeCli, PrototypeCommands, PrototypeEcho, PrototypeWebRTC, PrototypeDiscordVoice, PrototypeAttachments, PrototypeOutboundFiles, PrototypeFS, PrototypeInbound):
     def __init__(
         self,
         app,
@@ -52,6 +53,7 @@ class Prototype(PrototypeCommands, PrototypeEcho, PrototypeWebRTC, PrototypeDisc
             self.client_context = tenant.client_context
         self._fs = None
         self._settings = None
+        self._cli_tools = None
         self._awaiting_secret = set()
         self._inbound_bind()
 
@@ -90,6 +92,16 @@ class Prototype(PrototypeCommands, PrototypeEcho, PrototypeWebRTC, PrototypeDisc
         return self.app["config"].prototype
 
     @property
+    def is_local(self):
+        registry = self.app.get("tenants") if self.app is not None else None
+        if registry is None:
+            return False
+        tenant = registry.get(self.prototype_id)
+        if tenant is None:
+            return False
+        return bool(tenant.is_local)
+
+    @property
     def token(self):
         ctx = self.client_context
         if ctx is not None and ctx.token:
@@ -108,6 +120,13 @@ class Prototype(PrototypeCommands, PrototypeEcho, PrototypeWebRTC, PrototypeDisc
             acct_id=acct_id,
             **kwargs,
         )
+
+    async def notify_chat_external(self, *, chat_id, acct_id, text):
+        text = public_chat_error(text)
+        text = "%s You can reach this prototype's support for support. It is shown in the prototype details." % text
+        if not chat_id or not acct_id:
+            return
+        await self.send_outbound(text=text, chat_id=chat_id, acct_id=acct_id)
 
     async def send_outbound(
         self,
@@ -288,7 +307,7 @@ class Prototype(PrototypeCommands, PrototypeEcho, PrototypeWebRTC, PrototypeDisc
             chat_type=fields["chat_type"],
         ):
             return True
-        return await self._handle_basic_command(
+        if await self._handle_basic_command(
             cmd=cmd,
             args=args,
             chat_id=chat_id,
@@ -297,22 +316,19 @@ class Prototype(PrototypeCommands, PrototypeEcho, PrototypeWebRTC, PrototypeDisc
             model_settings=model_settings,
             platform=fields["platform"],
             chat_type=fields["chat_type"],
-        )
+        ):
+            return True
+        # Unknown slash commands are treated as /help. Station owns every /cmd.
+        await self._send_help(
+            chat_id=chat_id,
+            acct_id=acct_id,
+            reply_to=reply_to,
+            platform=fields["platform"],
+            chat_type=fields["chat_type"])
+        return True
 
     async def _handle_command_impl(self, data, model_id, model_settings, chat_id=None, acct_id=None, request_id=None):
-        if await self._dispatch_kind_command(data, model_settings, chat_id=chat_id, acct_id=acct_id):
-            return None
-        fields = validate_inbound_message_fields(data)
-        cmd, _ = self._slash_command(fields["text"])
-        if cmd == "/start":
-            await self.send_outbound(
-                text="hi",
-                chat_id=chat_id,
-                acct_id=acct_id,
-                reply_to=fields["msg_id"],
-                platform=fields["platform"],
-                chat_type=fields["chat_type"])
-            return
+        await self._dispatch_kind_command(data, model_settings, chat_id=chat_id, acct_id=acct_id)
         return None
 
     async def _handle_message_impl(self, data, model_id, model_settings, chat_id=None, acct_id=None, request_id=None):

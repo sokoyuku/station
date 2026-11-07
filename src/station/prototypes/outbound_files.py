@@ -1,7 +1,7 @@
-import contextlib
 import mimetypes
 import os
 
+from station import logger
 from station.errors import ExternalError
 from station.prototypes.attachments import attachment_type_for_path
 
@@ -99,6 +99,8 @@ class PrototypeOutboundFiles:
             platform=platform,
             chat_type=chat_type)
         for path in paths:
-            with contextlib.suppress(OSError):
+            try:
                 os.remove(path)
+            except OSError as exc:
+                logger.error("outbound file cleanup failed path=%s error=%s", path, exc)
         return ok

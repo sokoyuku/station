@@ -2,6 +2,8 @@ import os
 
 from station import logger
 from station.prototypes.voice_policy import (
+    audio_file_suffix,
+    ffmpeg_path,
     is_ogg_opus_audio,
     should_send_voice_reply,
     transcode_audio_to_ogg_opus,
@@ -67,14 +69,27 @@ class PrototypeVoice:
     ):
         if not audio_bytes:
             return
-        if not is_ogg_opus_audio(audio_bytes, content_type):
-            converted = transcode_audio_to_ogg_opus(audio_bytes)
-            if converted:
-                audio_bytes = converted
-                content_type = "audio/ogg"
         att_type = "voice"
         suffix = ".ogg"
-        mime = "audio/ogg" if is_ogg_opus_audio(audio_bytes, content_type) else (content_type or "audio/ogg")
+        mime = "audio/ogg"
+        if not is_ogg_opus_audio(audio_bytes, content_type):
+            if ffmpeg_path():
+                converted = transcode_audio_to_ogg_opus(audio_bytes)
+                if converted:
+                    audio_bytes = converted
+                    content_type = "audio/ogg"
+            else:
+                logger.warning(
+                    "ffmpeg missing; sending voice reply as an audio file model_id=%s",
+                    self.model_id,
+                )
+                att_type = "audio"
+                mime = (content_type or "audio/mpeg").split(";")[0].strip().lower() or "audio/mpeg"
+                suffix = audio_file_suffix(mime)
+        if is_ogg_opus_audio(audio_bytes, content_type):
+            att_type = "voice"
+            suffix = ".ogg"
+            mime = "audio/ogg"
         meta = self.save_temp(
             data=audio_bytes,
             original_name="%s%s" % (name, suffix),

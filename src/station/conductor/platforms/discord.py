@@ -15,6 +15,7 @@ from station.conductor.util import apply_sender, attachment_type_from_meta, ext_
 from station import logger
 from station.errors import ExternalError
 from station.prototypes.boundary import ext_dict, ext_list
+from station.timeouts import http_timeout, ws_timeout
 
 _THREAD_CHANNEL_TYPES = {10, 11, 12}
 
@@ -40,6 +41,35 @@ def _discord_application_flags(payload):
             except ValueError as e:
                 raise ExternalError("discord flags_new invalid") from e
     return ext_int(payload.get("flags"), "flags")
+
+
+def discord_mentions_bot(*, bot_id="", content="", mention_ids=None, referenced_author_id=""):
+    bot_id = (bot_id or "").strip()
+    if not bot_id:
+        return False
+    for uid in mention_ids or []:
+        if (uid or "").strip() == bot_id:
+            return True
+    content = content or ""
+    if ("<@%s>" % bot_id) in content or ("<@!%s>" % bot_id) in content:
+        return True
+    if (referenced_author_id or "").strip() == bot_id:
+        return True
+    return False
+
+
+def _discord_mention_ids_from_users(users):
+    ids = []
+    for user in users or []:
+        if user is None:
+            continue
+        if isinstance(user, dict):
+            uid = ext_id(user.get("id"), "id").strip()
+        else:
+            uid = ext_id(getattr(user, "id", None), "id").strip()
+        if uid:
+            ids.append(uid)
+    return ids
 
 
 def _discord_author_sender(author):
@@ -132,6 +162,9 @@ class _DiscordAcctState:
         "gateway_token",
         "gateway_user_id",
         "gateway_session_id",
+        "gateway_last_seq",
+        "gateway_resume_url",
+        "gateway_hb_ack",
     )
 
     def __init__(self) -> None:
@@ -143,6 +176,9 @@ class _DiscordAcctState:
         self.gateway_ready = asyncio.Event()
         self.gateway_token: str = ""
         self.gateway_user_id: str = ""
+        self.gateway_last_seq: int | None = None
+        self.gateway_resume_url: str = ""
+        self.gateway_hb_ack: bool = True
         self.gateway_session_id: str = ""
 
 class DiscordIO:
@@ -314,6 +350,7 @@ class DiscordIO:
             body["reply_to"] = message_id
         if chat_type:
             body["chat_type"] = chat_type
+        body["mentioned"] = True
         await self.conductor.deliver_inbound(
             model_id=model_id,
             acct_id=acct_id,
@@ -445,6 +482,7 @@ class DiscordIO:
         apply_sender(body, name=sender_name, username=sender_username)
         if chat_type:
             body["chat_type"] = chat_type
+        body["mentioned"] = False
         await self.conductor.deliver_inbound(
             model_id=model_id,
             acct_id=acct_id,
@@ -955,6 +993,124 @@ class DiscordIO:
             return False
         return st.gateway_ws is not None and not st.gateway_ws.closed and st.gateway_token == token
 
+    async def _handle_dsb_dispatch(self, st, *, acct_id: str, token: str, event_type: str, data: dict) -> None:
+        if event_type == "MESSAGE_REACTION_ADD":
+            await self._deliver_reaction_payload(acct_id=acct_id, data=data, removed=False)
+            return
+        if event_type == "MESSAGE_REACTION_REMOVE":
+            await self._deliver_reaction_payload(acct_id=acct_id, data=data, removed=True)
+            return
+        if event_type == "INTERACTION_CREATE":
+            if ext_int(data.get("type"), "type") != 3:
+                return
+            interaction_id = ext_id(data.get("id"), "id").strip()
+            interaction_token = ext_str(data.get("token"), "token").strip()
+            await self._ack_dsb_interaction(
+                token=token,
+                interaction_id=interaction_id,
+                interaction_token=interaction_token,
+            )
+            inner = data.get("data")
+            inner = ext_dict("discord interaction data", inner) if inner is not None else {}
+            custom_id = ext_str(inner.get("custom_id"), "custom_id").strip()
+            member = data.get("member")
+            user = data.get("user")
+            user_id = ""
+            sender_name = ""
+            sender_username = ""
+            if member is not None:
+                member = ext_dict("discord interaction member", member)
+                muser = member.get("user")
+                if muser is not None:
+                    muser = ext_dict("discord interaction member user", muser)
+                    user_id = ext_id(muser.get("id"), "id").strip()
+                    sender_name, sender_username = _discord_author_sender(muser)
+            if not user_id and user is not None:
+                user = ext_dict("discord interaction user", user)
+                user_id = ext_id(user.get("id"), "id").strip()
+                sender_name, sender_username = _discord_author_sender(user)
+            message = data.get("message")
+            message_id = ""
+            parent_id = ""
+            channel_type = 0
+            if message is not None:
+                message = ext_dict("discord interaction message", message)
+                message_id = ext_id(message.get("id"), "id").strip()
+            await self._deliver_component_interaction(
+                acct_id=acct_id,
+                interaction_id=interaction_id,
+                user_id=user_id,
+                channel_id=ext_id(data.get("channel_id"), "channel_id").strip(),
+                message_id=message_id,
+                custom_id=custom_id,
+                parent_id=parent_id,
+                channel_type=channel_type,
+                sender_name=sender_name,
+                sender_username=sender_username,
+            )
+            return
+        if event_type == "READY":
+            user = data.get("user")
+            user = ext_dict('discord READY user', user)
+            st.gateway_user_id = ext_id(user.get("id"), "id").strip()
+            session_id = ext_str(data.get("session_id"), "session_id").strip()
+            if session_id:
+                st.gateway_session_id = session_id
+            resume_url = ext_str(data.get("resume_gateway_url"), "resume_gateway_url").strip()
+            if resume_url:
+                st.gateway_resume_url = resume_url
+            st.gateway_ready.set()
+            return
+        if event_type == "RESUMED":
+            st.gateway_ready.set()
+            return
+        if event_type == "VOICE_STATE_UPDATE":
+            user_id = ext_id(data.get("user_id"), "user_id").strip()
+            if st.gateway_user_id and user_id and user_id != st.gateway_user_id:
+                return
+            guild_id = ext_id(data.get("guild_id"), "guild_id").strip()
+            if not guild_id:
+                return
+            channel_id = ext_id(data.get("channel_id"), "channel_id").strip()
+            session_id = ext_str(data.get("session_id") or st.gateway_session_id, "session_id").strip()
+            pending = st.voice_pending.get(guild_id)
+            if pending is None:
+                pending = {"guild_id": guild_id}
+            pending["user_id"] = user_id or st.gateway_user_id
+            pending["session_id"] = session_id
+            pending["channel_id"] = channel_id
+            if not pending.get("relay_chat_id") and channel_id:
+                pending["relay_chat_id"] = channel_id
+            st.voice_pending[guild_id] = pending
+            if not channel_id:
+                await self._relay_discord_voice(
+                    acct_id=acct_id,
+                    relay_chat_id=(ext_str(pending.get("relay_chat_id"), "relay_chat_id") or guild_id),
+                    user_id=ext_id(pending.get("user_id"), "user_id"),
+                    event_type="discord.voice.left",
+                    content={"guild_id": guild_id},
+                )
+                return
+            self._maybe_emit_credentials(acct_id, guild_id)
+            return
+        if event_type == "VOICE_SERVER_UPDATE":
+            guild_id = ext_id(data.get("guild_id"), "guild_id").strip()
+            endpoint = ext_str(data.get("endpoint"), "endpoint").strip()
+            token_v = ext_str(data.get("token"), "token").strip()
+            if not (guild_id and endpoint and token_v):
+                return
+            pending = st.voice_pending.get(guild_id)
+            if pending is None:
+                pending = {"guild_id": guild_id}
+            pending["endpoint"] = endpoint
+            pending["token"] = token_v
+            if not pending.get("user_id"):
+                pending["user_id"] = st.gateway_user_id
+            if not pending.get("session_id"):
+                pending["session_id"] = st.gateway_session_id or "dsb_session"
+            st.voice_pending[guild_id] = pending
+            self._maybe_emit_credentials(acct_id, guild_id)
+
     async def _dsb_gateway_loop(self, *, acct_id: str, token: str) -> None:
         st = self._acct_state(acct_id)
         base = self._api_base()
@@ -971,14 +1127,59 @@ class DiscordIO:
                 gateway_url = "ws://" + base[len("http://"):] + "/gateway"
             else:
                 gateway_url = "ws://" + base + "/gateway"
+        dispatch_q: asyncio.Queue = asyncio.Queue()
+
+        async def _drain_dispatch() -> None:
+            while True:
+                item = await dispatch_q.get()
+                if item is None:
+                    return
+                event_type, data = item
+                try:
+                    await self._handle_dsb_dispatch(
+                        st, acct_id=acct_id, token=token, event_type=event_type, data=data,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    logger.error("unexpected where=discord_gateway_dispatch acct_id=%s error=%s", acct_id, e, exc_info=e)
+
+        worker = asyncio.create_task(_drain_dispatch())
+        try:
+            connect_mode = "identify"
+            while st.gateway_token == token and not self.conductor.poller_stop.is_set():
+                connect_mode = await self._dsb_gateway_session(
+                    st,
+                    acct_id=acct_id,
+                    token=token,
+                    gateway_url=gateway_url,
+                    dispatch_q=dispatch_q,
+                    connect_mode=connect_mode,
+                )
+                if connect_mode == "stop" or st.gateway_token != token or self.conductor.poller_stop.is_set():
+                    return
+                await asyncio.sleep(1)
+        finally:
+            dispatch_q.put_nowait(None)
+            worker.cancel()
+            try:
+                await worker
+            except (asyncio.CancelledError, Exception):
+                pass
+
+    async def _dsb_gateway_session(self, st, *, acct_id: str, token: str, gateway_url: str, dispatch_q: asyncio.Queue, connect_mode: str) -> str:
         ws = None
         heartbeat_task = None
+        next_mode = "resume" if connect_mode == "resume" else "identify"
         try:
+            url = gateway_url
+            if connect_mode == "resume" and st.gateway_resume_url:
+                url = st.gateway_resume_url
             try:
-                ws = await self.session.ws_connect(gateway_url, heartbeat=None)
+                ws = await self.session.ws_connect(url, heartbeat=None, timeout=ws_timeout())
             except (aiohttp.ClientError, OSError) as e:
                 logger.error("unexpected where=discord_gateway_connect acct_id=%s error=%s", acct_id, e, exc_info=e)
-                return
+                return next_mode
             st.gateway_ws = ws
             async for msg in ws:
                 if msg.type != aiohttp.WSMsgType.TEXT:
@@ -987,149 +1188,93 @@ class DiscordIO:
                     continue
                 try:
                     frame = json.loads(msg.data)
-                except json.JSONDecodeError:
-                    continue
+                except json.JSONDecodeError as exc:
+                    logger.error("discord gateway malformed JSON acct_id=%s error=%s", acct_id, exc)
+                    raise ExternalError("discord gateway malformed JSON") from exc
                 frame = ext_dict('discord gateway frame', frame)
                 op = frame.get("op")
                 if op == 10:
                     d = frame.get("d")
                     d = ext_dict('discord hello d', d)
                     interval = float(d.get("heartbeat_interval") or 0) / 1000.0
-                    await ws.send_json({
-                        "op": 2,
-                        "d": {
-                            "token": token,
-                            "properties": {"os": "linux", "browser": "station", "device": "station"},
-                            "intents": 129 | 1024 | 8192,
-                        },
-                    })
+                    st.gateway_hb_ack = True
+                    if connect_mode == "resume" and st.gateway_session_id and st.gateway_last_seq is not None:
+                        await ws.send_json({
+                            "op": 6,
+                            "d": {
+                                "token": token,
+                                "session_id": st.gateway_session_id,
+                                "seq": st.gateway_last_seq,
+                            },
+                        })
+                    else:
+                        await ws.send_json({
+                            "op": 2,
+                            "d": {
+                                "token": token,
+                                "properties": {"os": "linux", "browser": "station", "device": "station"},
+                                "intents": 129 | 1024 | 8192,
+                            },
+                        })
                     if interval > 0:
                         if heartbeat_task is not None:
                             heartbeat_task.cancel()
                         async def _hb(ws=ws, interval=interval):
                             while True:
                                 await asyncio.sleep(interval)
-                                await ws.send_json({"op": 1, "d": None})
+                                if not st.gateway_hb_ack:
+                                    try:
+                                        await ws.close(code=4000)
+                                    except Exception:
+                                        return
+                                    return
+                                st.gateway_hb_ack = False
+                                await ws.send_json({"op": 1, "d": st.gateway_last_seq})
                         heartbeat_task = asyncio.create_task(_hb())
                     continue
                 if op == 11:
+                    st.gateway_hb_ack = True
                     continue
+                if op == 7:
+                    break
+                if op == 9:
+                    if frame.get("d") is not True:
+                        st.gateway_session_id = ""
+                        st.gateway_last_seq = None
+                        st.gateway_resume_url = ""
+                    break
                 if op == 1:
-                    await ws.send_json({"op": 1, "d": None})
+                    st.gateway_hb_ack = False
+                    await ws.send_json({"op": 1, "d": st.gateway_last_seq})
                     continue
                 if op != 0:
                     continue
+                raw_seq = frame.get("s")
+                if isinstance(raw_seq, bool):
+                    raw_seq = None
+                if isinstance(raw_seq, int):
+                    st.gateway_last_seq = raw_seq
+                elif isinstance(raw_seq, float) and raw_seq.is_integer():
+                    st.gateway_last_seq = int(raw_seq)
                 event_type = ext_str(frame.get("t"), "t").strip()
                 data = frame.get("d")
                 data = ext_dict('discord dispatch d', data)
-                if event_type == "MESSAGE_REACTION_ADD":
-                    await self._deliver_reaction_payload(acct_id=acct_id, data=data, removed=False)
-                    continue
-                if event_type == "MESSAGE_REACTION_REMOVE":
-                    await self._deliver_reaction_payload(acct_id=acct_id, data=data, removed=True)
-                    continue
-                if event_type == "INTERACTION_CREATE":
-                    if ext_int(data.get("type"), "type") != 3:
-                        continue
-                    interaction_id = ext_id(data.get("id"), "id").strip()
-                    interaction_token = ext_str(data.get("token"), "token").strip()
-                    await self._ack_dsb_interaction(
-                        token=token,
-                        interaction_id=interaction_id,
-                        interaction_token=interaction_token,
-                    )
-                    inner = data.get("data")
-                    inner = ext_dict("discord interaction data", inner) if inner is not None else {}
-                    custom_id = ext_str(inner.get("custom_id"), "custom_id").strip()
-                    member = data.get("member")
-                    user = data.get("user")
-                    user_id = ""
-                    sender_name = ""
-                    sender_username = ""
-                    if member is not None:
-                        member = ext_dict("discord interaction member", member)
-                        muser = member.get("user")
-                        if muser is not None:
-                            muser = ext_dict("discord interaction member user", muser)
-                            user_id = ext_id(muser.get("id"), "id").strip()
-                            sender_name, sender_username = _discord_author_sender(muser)
-                    if not user_id and user is not None:
-                        user = ext_dict("discord interaction user", user)
-                        user_id = ext_id(user.get("id"), "id").strip()
-                        sender_name, sender_username = _discord_author_sender(user)
-                    message = data.get("message")
-                    message_id = ""
-                    parent_id = ""
-                    channel_type = 0
-                    if message is not None:
-                        message = ext_dict("discord interaction message", message)
-                        message_id = ext_id(message.get("id"), "id").strip()
-                    await self._deliver_component_interaction(
-                        acct_id=acct_id,
-                        interaction_id=interaction_id,
-                        user_id=user_id,
-                        channel_id=ext_id(data.get("channel_id"), "channel_id").strip(),
-                        message_id=message_id,
-                        custom_id=custom_id,
-                        parent_id=parent_id,
-                        channel_type=channel_type,
-                        sender_name=sender_name,
-                        sender_username=sender_username,
+                if event_type in ("READY", "RESUMED"):
+                    await self._handle_dsb_dispatch(
+                        st, acct_id=acct_id, token=token, event_type=event_type, data=data,
                     )
                     continue
-                if event_type == "READY":
-                    user = data.get("user")
-                    user = ext_dict('discord READY user', user)
-                    st.gateway_user_id = ext_id(user.get("id"), "id").strip()
-                    st.gateway_session_id = ext_str(data.get("session_id"), "session_id", default="dsb_session").strip() or "dsb_session"
-                    st.gateway_ready.set()
-                    continue
-                if event_type == "VOICE_STATE_UPDATE":
-                    user_id = ext_id(data.get("user_id"), "user_id").strip()
-                    if st.gateway_user_id and user_id and user_id != st.gateway_user_id:
-                        continue
-                    guild_id = ext_id(data.get("guild_id"), "guild_id").strip()
-                    if not guild_id:
-                        continue
-                    channel_id = ext_id(data.get("channel_id"), "channel_id").strip()
-                    session_id = ext_str(data.get("session_id") or st.gateway_session_id, "session_id").strip()
-                    pending = st.voice_pending.get(guild_id)
-                    if pending is None:
-                        pending = {"guild_id": guild_id}
-                    pending["user_id"] = user_id or st.gateway_user_id
-                    pending["session_id"] = session_id
-                    pending["channel_id"] = channel_id
-                    if not pending.get("relay_chat_id") and channel_id:
-                        pending["relay_chat_id"] = channel_id
-                    st.voice_pending[guild_id] = pending
-                    if not channel_id:
-                        await self._relay_discord_voice(
-                            acct_id=acct_id,
-                            relay_chat_id=(ext_str(pending.get("relay_chat_id"), "relay_chat_id") or guild_id),
-                            user_id=ext_id(pending.get("user_id"), "user_id"),
-                            event_type="discord.voice.left",
-                            content={"guild_id": guild_id},
-                        )
-                        continue
-                    self._maybe_emit_credentials(acct_id, guild_id)
-                    continue
-                if event_type == "VOICE_SERVER_UPDATE":
-                    guild_id = ext_id(data.get("guild_id"), "guild_id").strip()
-                    endpoint = ext_str(data.get("endpoint"), "endpoint").strip()
-                    token_v = ext_str(data.get("token"), "token").strip()
-                    if not (guild_id and endpoint and token_v):
-                        continue
-                    pending = st.voice_pending.get(guild_id)
-                    if pending is None:
-                        pending = {"guild_id": guild_id}
-                    pending["endpoint"] = endpoint
-                    pending["token"] = token_v
-                    if not pending.get("user_id"):
-                        pending["user_id"] = st.gateway_user_id
-                    if not pending.get("session_id"):
-                        pending["session_id"] = st.gateway_session_id or "dsb_session"
-                    st.voice_pending[guild_id] = pending
-                    self._maybe_emit_credentials(acct_id, guild_id)
+                dispatch_q.put_nowait((event_type, data))
+            code = ws.close_code if ws is not None else None
+            if code in (4004, 4010, 4011, 4012, 4013, 4014):
+                next_mode = "stop"
+            elif code in (4007, 4009) or not st.gateway_session_id or st.gateway_last_seq is None:
+                st.gateway_session_id = ""
+                st.gateway_last_seq = None
+                st.gateway_resume_url = ""
+                next_mode = "identify"
+            else:
+                next_mode = "resume"
         except asyncio.CancelledError:
             raise
         except Exception as e:
@@ -1138,13 +1283,14 @@ class DiscordIO:
             if heartbeat_task is not None:
                 heartbeat_task.cancel()
             st.gateway_ready.clear()
-            if ws is not None:
+            if ws is not None and not ws.closed:
                 try:
-                    await ws.close()
+                    await ws.close(code=4000)
                 except Exception as e:
                     logger.error("unexpected where=discord_gateway_close acct_id=%s error=%s", acct_id, e, exc_info=e)
             if st.gateway_ws is ws:
                 st.gateway_ws = None
+        return next_mode
 
     async def voice_state_update(
         self,
@@ -1379,6 +1525,20 @@ class DiscordIO:
                 body["reply_to_text"] = reply_to_text
             if chat_type:
                 body["chat_type"] = chat_type
+            bot_id = ""
+            if client.user is not None:
+                bot_id = ext_id(client.user.id, "user.id").strip()
+            ref_author = ""
+            if ref is not None and getattr(ref, "resolved", None) is not None:
+                resolved_author = getattr(ref.resolved, "author", None)
+                if resolved_author is not None:
+                    ref_author = ext_id(resolved_author.id, "id").strip()
+            body["mentioned"] = discord_mentions_bot(
+                bot_id=bot_id,
+                content=ext_str(message.content, "content"),
+                mention_ids=_discord_mention_ids_from_users(message.mentions),
+                referenced_author_id=ref_author,
+            )
             if not content and not attachments:
                 body["raw"] = {
                     "id": msg_id,
@@ -1774,6 +1934,20 @@ class DiscordIO:
                             body["reply_to_text"] = reply_to_text
                         if chat_type:
                             body["chat_type"] = chat_type
+                        ref_author = ""
+                        referenced = m.get("referenced_message")
+                        if referenced is not None:
+                            referenced = ext_dict("discord referenced_message", referenced)
+                            ref_user = referenced.get("author")
+                            if ref_user is not None:
+                                ref_user = ext_dict("discord referenced author", ref_user)
+                                ref_author = ext_id(ref_user.get("id"), "id").strip()
+                        body["mentioned"] = discord_mentions_bot(
+                            bot_id=self_id,
+                            content=ext_str(m.get("content"), "content"),
+                            mention_ids=_discord_mention_ids_from_users(m.get("mentions")),
+                            referenced_author_id=ref_author,
+                        )
                         if not content and not attachments:
                             body["raw"] = m
                         ok = await self.conductor.deliver_inbound(

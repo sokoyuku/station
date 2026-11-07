@@ -18,8 +18,23 @@ from station.conductor.platforms.keyboard import join_text_and_keyboard, parse_k
 from station.conductor.platforms.policy import allows_media
 from station.conductor.util import apply_sender, attachment_type_from_meta, ext_id, ext_int, ext_str
 from station import logger
+from station.timeouts import IO_TIMEOUT_S, BoundedLock, wait, ws_timeout
 from station.errors import ExternalError
 from station.prototypes.boundary import ext_dict, ext_float, ext_list
+
+def _qq_expires_in(value):
+    if value is None:
+        return 7200
+    if type(value) is int:
+        if value <= 0:
+            raise ExternalError("expires_in must be positive")
+        return value
+    if type(value) is str and value.strip().isdigit():
+        parsed = int(value.strip())
+        if parsed <= 0:
+            raise ExternalError("expires_in must be positive")
+        return parsed
+    raise ExternalError("expires_in must be int, got %s" % type(value).__name__)
 
 TOKEN_URL = "https://bots.qq.com/app/getAppAccessToken"
 DEFAULT_API_BASE = "https://api.sgroup.qq.com"
@@ -144,7 +159,7 @@ def _parse_interaction(d):
 class QQIO:
     def __init__(self, conductor):
         self.conductor = conductor
-        self._token_lock = asyncio.Lock()
+        self._token_lock = BoundedLock(where="qq token")
         self._access_by_app: dict[str, dict] = {}
         self._chat_type_map: dict[str, dict[str, str]] = {}
         self._last_msg_id: dict[str, dict[str, str]] = {}
@@ -306,7 +321,7 @@ class QQIO:
             token = ext_str(data.get("access_token"), "access_token").strip()
             if not token:
                 raise RuntimeError(f"token missing: {data}")
-            expires_in = ext_int(data.get("expires_in"), "expires_in", default=7200)
+            expires_in = _qq_expires_in(data.get("expires_in"))
             self._access_by_app[app_id] = {
                 "token": token,
                 "expires_at": time.time() + expires_in,
@@ -815,7 +830,7 @@ class QQIO:
                 import pilk
 
                 try:
-                    await asyncio.to_thread(pilk.silk_to_wav, src_path, wav_path, rate=16000)
+                    await wait(asyncio.to_thread(pilk.silk_to_wav, src_path, wav_path, rate=16000), IO_TIMEOUT_S, "qq silk_to_wav")
                     if os.path.isfile(wav_path) and os.path.getsize(wav_path) > 44:
                         return wav_path
                 except (OSError, RuntimeError, ValueError) as e:
@@ -825,7 +840,11 @@ class QQIO:
 
                     shutil.copy2(src_path, silk_path)
                     try:
-                        await asyncio.to_thread(pilk.silk_to_wav, silk_path, wav_path, rate=16000)
+                        await wait(
+                            asyncio.to_thread(pilk.silk_to_wav, silk_path, wav_path, rate=16000),
+                            IO_TIMEOUT_S,
+                            "qq silk_to_wav",
+                        )
                         if os.path.isfile(wav_path) and os.path.getsize(wav_path) > 44:
                             return wav_path
                     finally:
@@ -846,10 +865,10 @@ class QQIO:
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.DEVNULL,
             )
-            await proc.wait()
-            if os.path.isfile(wav_path) and os.path.getsize(wav_path) > 44:
-                return wav_path
-            return None
+            code = await wait(proc.wait(), IO_TIMEOUT_S, "qq ffmpeg")
+            if code != 0 or not os.path.isfile(wav_path) or os.path.getsize(wav_path) <= 44:
+                raise ExternalError("qq ffmpeg failed code=%s" % code)
+            return wav_path
         finally:
             try:
                 os.unlink(src_path)
@@ -978,6 +997,7 @@ class QQIO:
         reply_to="",
         reply_to_text="",
         sender_username="",
+        mentioned=None,
     ):
         chat_id = (chat_id or "").strip()
         if not chat_id:
@@ -1030,6 +1050,8 @@ class QQIO:
             body["reply_to"] = reply_to
         if reply_to_text:
             body["reply_to_text"] = reply_to_text
+        if mentioned is not None:
+            body["mentioned"] = bool(mentioned)
         if raw is not None:
             body["raw"] = raw
         return await self.conductor.deliver_inbound(
@@ -1067,10 +1089,10 @@ class QQIO:
             text = content
             chat_kind = "c2c"
             user_id = user_openid
-        elif event_type == "GROUP_AT_MESSAGE_CREATE":
+        elif event_type in ("GROUP_AT_MESSAGE_CREATE", "GROUP_MESSAGE_CREATE"):
             chat_id = ext_id(d.get("group_openid"), "group_openid").strip()
             user_id = ext_str(author.get("member_openid") or author.get("id"), "member_openid").strip()
-            text = self._strip_at_mention(content)
+            text = self._strip_at_mention(content) if event_type == "GROUP_AT_MESSAGE_CREATE" else content
             chat_kind = "group"
         elif event_type in ("GUILD_MESSAGE_CREATE", "GUILD_AT_MESSAGE_CREATE"):
             chat_id = ext_id(d.get("channel_id"), "channel_id").strip()
@@ -1135,6 +1157,13 @@ class QQIO:
         if not text and not atts and not raw_atts and location is None:
             return
         raw = d if (not text and not atts and not raw_atts) else None
+        mentioned = event_type in (
+            "C2C_MESSAGE_CREATE",
+            "DIRECT_MESSAGE_CREATE",
+            "GROUP_AT_MESSAGE_CREATE",
+            "GUILD_AT_MESSAGE_CREATE",
+            "AT_MESSAGE_CREATE",
+        )
         ok = await self._deliver(
             acct_id=acct_id,
             chat_id=chat_id,
@@ -1149,6 +1178,7 @@ class QQIO:
             reply_to=quote_reply,
             reply_to_text=reply_to_text,
             sender_username=ext_str(author.get("username"), "username").strip(),
+            mentioned=mentioned,
         )
         if ok:
             self._mark_seen(acct_id, msg_id)
@@ -1197,6 +1227,7 @@ class QQIO:
             text=text,
             attachments=[],
             token=token,
+            mentioned=True,
         )
         if ok:
             self._mark_seen(acct_id, msg_id)
@@ -1307,12 +1338,12 @@ class QQIO:
                     return
                 await self._ensure_access_token(app_id=app_id, client_secret=client_secret)
                 gateway_url = await self._get_gateway_url(token=token, server=server)
-                ws_session = aiohttp.ClientSession(trust_env=True)
+                ws_session = aiohttp.ClientSession(timeout=ws_timeout(), trust_env=True)
                 ws = await ws_session.ws_connect(
                     gateway_url,
                     headers={"User-Agent": "StationQQIO/1.0"},
                     heartbeat=None,
-                    timeout=20,
+                    timeout=ws_timeout(),
                 )
                 heartbeat_interval = {"v": 30.0}
 
@@ -1333,8 +1364,9 @@ class QQIO:
                     if msg.type == aiohttp.WSMsgType.TEXT:
                         try:
                             payload = json.loads(msg.data)
-                        except json.JSONDecodeError:
-                            continue
+                        except json.JSONDecodeError as exc:
+                            logger.error("qq gateway malformed JSON error=%s", exc)
+                            raise ExternalError("qq gateway malformed JSON") from exc
                         payload = ext_dict('qq gateway payload', payload)
                         op = payload.get("op")
                         t = payload.get("t")
@@ -1370,6 +1402,7 @@ class QQIO:
                             elif t in {
                                 "C2C_MESSAGE_CREATE",
                                 "GROUP_AT_MESSAGE_CREATE",
+                                "GROUP_MESSAGE_CREATE",
                                 "GUILD_MESSAGE_CREATE",
                                 "GUILD_AT_MESSAGE_CREATE",
                                 "DIRECT_MESSAGE_CREATE",

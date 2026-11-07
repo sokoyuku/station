@@ -3,6 +3,7 @@ import json
 
 from station import logger
 from station.prototypes.gateway_process import close_subprocess
+from station.timeouts import DRAIN_TIMEOUT_S, TURN_TIMEOUT_S, BoundedLock, read_line, read_some, wait
 
 class JsonLineRpcProcess:
     def __init__(self, *, request_id_prefix, stop_error):
@@ -11,7 +12,7 @@ class JsonLineRpcProcess:
         self._pending = {}
         self._stdout_task = None
         self._stderr_task = None
-        self._write_lock = asyncio.Lock()
+        self._write_lock = BoundedLock(where="%s stdin" % request_id_prefix)
         self._request_id_prefix = request_id_prefix
         self._stop_error = stop_error
         self._line_buf = b""
@@ -35,9 +36,9 @@ class JsonLineRpcProcess:
         line = json.dumps(message, ensure_ascii=True)
         async with self._write_lock:
             self.proc.stdin.write((line + "\n").encode("utf-8"))
-            await self.proc.stdin.drain()
+            await wait(self.proc.stdin.drain(), DRAIN_TIMEOUT_S, "%s stdin drain" % self._request_id_prefix)
 
-    async def _request_future(self, message, *, timeout_s=None):
+    async def _request_future(self, message, *, timeout_s=TURN_TIMEOUT_S):
         if self.proc is None or self.proc.returncode is not None or self.proc.stdin is None:
             raise RuntimeError(self._stop_error)
         request_id = self._new_request_id()
@@ -47,9 +48,7 @@ class JsonLineRpcProcess:
         payload["id"] = request_id
         await self._write_line(payload)
         try:
-            if timeout_s is None:
-                return await future
-            return await asyncio.wait_for(future, timeout=timeout_s)
+            return await wait(future, timeout_s, "%s request" % self._request_id_prefix)
         finally:
             self._pending.pop(request_id, None)
 
@@ -73,7 +72,7 @@ class JsonLineRpcProcess:
         proc = self.proc
         if buffered:
             while True:
-                chunk = await proc.stdout.read(65536)
+                chunk = await read_some(proc.stdout, 65536, "%s stdout" % self._request_id_prefix)
                 if not chunk:
                     break
                 self._line_buf += chunk
@@ -90,7 +89,7 @@ class JsonLineRpcProcess:
                     await on_line(raw_line.decode("utf-8", "replace"))
         else:
             while True:
-                line = await proc.stdout.readline()
+                line = await read_line(proc.stdout, "%s stdout" % self._request_id_prefix)
                 if not line:
                     break
                 raw = line.decode("utf-8", "replace").strip()
@@ -100,7 +99,7 @@ class JsonLineRpcProcess:
     async def _read_stderr_lines(self, *, label):
         proc = self.proc
         while True:
-            line = await proc.stderr.readline()
+            line = await read_line(proc.stderr, "%s stderr" % self._request_id_prefix)
             if not line:
                 break
             text = line.decode("utf-8", "replace").rstrip()
@@ -111,18 +110,20 @@ class JsonLineRpcProcess:
 
         try:
             return json.loads(text)
-        except json.JSONDecodeError:
-            logger.warning("%s malformed JSON: %s", label, text[:500])
-            return None
+        except json.JSONDecodeError as exc:
+            logger.error("%s malformed JSON error=%s text=%s", label, exc, text[:500])
+            raise RuntimeError("%s malformed JSON" % label) from exc
 
     async def _pump_stdout(self, *, label, on_frame, buffered=True, on_close=None):
         async def on_line(raw):
             frame = self._parse_json_line(raw, label=label)
-            if frame is None:
-                return
             await on_frame(frame)
 
-        await self._read_stdout_lines(on_line=on_line, buffered=buffered)
+        try:
+            await self._read_stdout_lines(on_line=on_line, buffered=buffered)
+        except Exception:
+            self._fail_pending("%s stdout failed" % label)
+            raise
         if on_close is not None:
             on_close()
             return

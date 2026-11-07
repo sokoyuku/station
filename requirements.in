@@ -1,0 +1,11 @@
+# Intent. Lock with:
+#   uv pip compile requirements.in -o requirements.txt --generate-hashes --universal --python-version 3.12
+aiohttp[speedups]>=3.10,<4
+uvloop>=0.21,<1
+aiortc>=1.9,<2
+cryptography>=43,<50
+asyncpg>=0.29,<1
+discord.py>=2.4,<3
+PyNaCl>=1.5,<2
+audioop-lts>=0.2,<1; python_version >= "3.13"
+cursor-sdk>=1,<2

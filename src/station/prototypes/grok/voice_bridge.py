@@ -1,12 +1,12 @@
 import asyncio
-import audioop
-import os
-import wave
 from dataclasses import dataclass
 
 import aiohttp
 
 from station import logger
+
+from station.prototypes.grok.hermes_supervisor import hermes_chat_context
+from station.prototypes.grok.tools import live_function_tools, live_session_instructions
 
 from .realtime import GrokRealtimeSession
 
@@ -17,7 +17,6 @@ class RealtimeCallState:
     acct_id: str
     platform: str = ""
     chat_type: str = ""
-    mute_live_audio: bool = False
 
 class GrokVoiceBridge:
     async def _start_realtime(self, *, call_key, chat_key, acct_key, push_audio_pcm, platform="", chat_type=""):
@@ -36,23 +35,52 @@ class GrokVoiceBridge:
             return None
 
         async def on_transcript(kind, text):
+            cleaned = (text or "").strip()
+            if not cleaned:
+                return
+            logger.info(
+                "Grok realtime transcript kind=%s chat_id=%s text=%s",
+                kind,
+                chat_key,
+                cleaned,
+            )
+            if not settings.realtime_chat_transcripts:
+                return
             prefix = "TRANSCRIPT_IN:" if kind == "input" else "TRANSCRIPT_OUT:"
             await self.send_outbound(
-                text="%s %s" % (prefix, text),
+                text="%s %s" % (prefix, cleaned),
                 chat_id=chat_key,
                 acct_id=acct_key,
                 platform=platform,
                 chat_type=chat_type)
+
+        instructions = settings.system_prompt or "You are a concise voice assistant."
+        instructions = "%s\n%s" % (instructions, live_session_instructions())
+
+        async def on_tool(name, arguments, turn_state):
+            token = hermes_chat_context.set({
+                "chat_id": chat_key,
+                "acct_id": acct_key,
+                "platform": platform,
+                "chat_type": chat_type,
+            })
+            try:
+                return await self._realtime_tool(name, arguments, turn_state)
+            finally:
+                hermes_chat_context.reset(token)
 
         session = GrokRealtimeSession(
             access_token=access_token,
             base_url=settings.base_url,
             model=settings.realtime_model,
             voice=settings.realtime_voice or settings.tts_voice_id,
-            instructions=settings.system_prompt or "You are a concise voice assistant for automated tests.",
+            instructions=instructions,
             sample_rate=settings.realtime_sample_rate,
             push_audio_pcm_48k=push_audio_pcm,
             on_transcript=on_transcript,
+            on_tool=on_tool,
+            on_fail=self._fail_realtime_turn,
+            function_tools=live_function_tools(),
         )
         try:
             await session.start()
@@ -88,7 +116,7 @@ class GrokVoiceBridge:
             return None
         async with self._realtime_guard:
             state = self._realtime_by_call.get(call_key)
-        if state is None or state.mute_live_audio:
+        if state is None:
             return None
         await state.session.append_pcm_48k_mono(pcm_s16le_mono_48k)
         return None
@@ -143,45 +171,6 @@ class GrokVoiceBridge:
     async def on_discord_voice_ended(self, *, guild_id, channel_id, chat_id, acct_id, model_id):
         call_key = self._discord_voice_call_key(guild_id=guild_id, channel_id=channel_id, chat_id=chat_id)
         return await self._end_realtime(call_key=call_key)
-
-    async def _feed_voice_sample(self, state):
-        path = os.path.abspath(
-            os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", "..", "ds", "samples", "voice.wav")
-        )
-        if not os.path.isfile(path):
-            await self.send_outbound(
-                text="VOICE_SAMPLE_MISSING",
-                chat_id=state.chat_id,
-                acct_id=state.acct_id,
-                platform=state.platform,
-                chat_type=state.chat_type)
-            return
-        state.mute_live_audio = True
-        try:
-            with wave.open(path, "rb") as wav:
-                channels = wav.getnchannels()
-                sample_width = wav.getsampwidth()
-                rate = wav.getframerate()
-                frames = wav.readframes(wav.getnframes())
-            if sample_width != 2 or channels not in {1, 2}:
-                await self.send_outbound(
-                    text="VOICE_SAMPLE_UNSUPPORTED",
-                    chat_id=state.chat_id,
-                    acct_id=state.acct_id,
-                    platform=state.platform,
-                    chat_type=state.chat_type)
-                return
-            pcm = frames
-            if channels == 2:
-                pcm = audioop.tomono(pcm, 2, 0.5, 0.5)
-            if rate != 48000:
-                pcm, _ = audioop.ratecv(pcm, 2, 1, rate, 48000, None)
-            await state.session.begin_manual_audio()
-            await state.session.append_pcm_48k_mono(pcm)
-            await state.session.commit_audio()
-            logger.info("Grok realtime fed voice sample bytes=%d path=%s", len(pcm), path)
-        finally:
-            state.mute_live_audio = False
 
     async def _active_realtime_for_chat(self, chat_id):
         async with self._realtime_guard:

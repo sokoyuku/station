@@ -1,7 +1,8 @@
 import os
 import re
-import time
 import uuid
+
+from station import instant
 
 from station.errors import ExternalError, InternalError
 from station.prototypes.boundary import ext_dict, ext_list, ext_str, validate_attachment
@@ -161,7 +162,7 @@ class BoundFileSystem:
             original_name=original_name,
             mime_type=mime_type,
             size_bytes=size_bytes,
-            created_at=time.time(),
+            created_at=instant.now(),
             info=info,
             remote_file_id=remote_file_id,
             url=url,
@@ -318,6 +319,21 @@ class BoundFileSystem:
             info=info,
             ext=ext,
             file_id=file_id,
+        )
+
+    def save_chat(self, *, data, original_name=None, mime_type=None, info=None, ext=None, file_id=None, chat_id=None, acct_id=None):
+        if data is None:
+            raise ExternalError("missing_data")
+        return self._place_ready(
+            data=data,
+            kind="chat",
+            original_name=original_name,
+            mime_type=mime_type,
+            info=info,
+            ext=ext,
+            file_id=file_id,
+            chat_id=chat_id,
+            acct_id=acct_id,
         )
 
     def register_inbound_attachment(self, attachment, *, chat_id=None, acct_id=None):

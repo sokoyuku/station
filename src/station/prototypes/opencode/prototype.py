@@ -109,11 +109,6 @@ class OpenCodePrototype(PrototypeModelConfig, OpenCodeAuthFlow, PrototypeWorkspa
         if settings is None:
             return
         if settings.uses_local_llm():
-            await self._apply_provider_api_key(
-                gateway,
-                settings.gateway_provider(),
-                settings.local_llm_api_key or settings.api_key or "local",
-            )
             return
         if settings.uses_xai() and settings.api_key:
             await self._apply_xai_api_key(gateway, settings.api_key)
@@ -151,6 +146,8 @@ class OpenCodePrototype(PrototypeModelConfig, OpenCodeAuthFlow, PrototypeWorkspa
         return True
 
     async def _handle_inbound_context(self, ctx):
+        if await self._capture_oauth_code(acct_id=ctx.acct_id, text=ctx.text or ""):
+            return
         if not await self._ensure_provider_auth(
             acct_id=ctx.acct_id,
             chat_id=ctx.chat_id,

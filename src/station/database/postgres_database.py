@@ -1,10 +1,28 @@
 import json
 import hashlib
-import time
 import asyncio
 import concurrent.futures
 
-from station.client.consul import fetch_model
+from station import instant
+from station.database.consul_state import fetch_and_apply_model
+
+
+async def _timestamptz(conn, table, column):
+    row = await conn.fetchrow(
+        """
+        SELECT data_type
+        FROM information_schema.columns
+        WHERE table_schema = 'public' AND table_name = $1 AND column_name = $2
+        """,
+        table,
+        column,
+    )
+    if row is None or row["data_type"] == "timestamp with time zone":
+        return
+    await conn.execute(
+        f"ALTER TABLE {table} ALTER COLUMN {column} TYPE TIMESTAMPTZ "
+        f"USING CASE WHEN {column} IS NULL THEN NULL ELSE to_timestamp({column}) END"
+    )
 from station.conductor.platform_types import strip_qr_prefix, validate_local_platform_type
 from station.database import AsyncDatabase
 from station.database.request_dedupe import shared_dedupe_cache
@@ -18,6 +36,14 @@ from station.database.file_registry import (
 from station.errors import ExternalError, InternalError
 from station.prototypes.boundary import ext_dict, ext_list
 from station import logger
+from station.timeouts import DB_TIMEOUT_S, BoundedLock, wait
+
+STATION_DB_OWNER = "station_runtime"
+
+
+async def _assume_station_owner(conn) -> None:
+    await conn.execute("SELECT set_config('role', $1, false)", STATION_DB_OWNER)
+
 
 class PostgresDatabase(AsyncDatabase):
     def __init__(self, *, dsn: str, pool, lock_conn, enable_local_conductor: bool = False):
@@ -25,7 +51,7 @@ class PostgresDatabase(AsyncDatabase):
         self.pool = pool
 
         self._lock_conn = lock_conn
-        self._lock_mu = asyncio.Lock()
+        self._lock_mu = BoundedLock(where="postgres model lock")
         self.enable_local_conductor = enable_local_conductor
 
     @classmethod
@@ -37,8 +63,24 @@ class PostgresDatabase(AsyncDatabase):
                 "PostgreSQL backend requires asyncpg. Install it (e.g. pip install asyncpg)."
             ) from e
 
-        pool = await asyncpg.create_pool(dsn=dsn, min_size=2, max_size=20)
-        lock_conn = await asyncpg.connect(dsn=dsn)
+        pool = await wait(
+            asyncpg.create_pool(
+                dsn=dsn,
+                min_size=2,
+                max_size=20,
+                timeout=DB_TIMEOUT_S,
+                command_timeout=DB_TIMEOUT_S,
+                init=_assume_station_owner,
+            ),
+            DB_TIMEOUT_S,
+            "postgres pool",
+        )
+        lock_conn = await wait(
+            asyncpg.connect(dsn=dsn, timeout=DB_TIMEOUT_S, command_timeout=DB_TIMEOUT_S),
+            DB_TIMEOUT_S,
+            "postgres lock connection",
+        )
+        await _assume_station_owner(lock_conn)
         self = cls(
             dsn=dsn,
             pool=pool,
@@ -158,7 +200,7 @@ class PostgresDatabase(AsyncDatabase):
                         version INTEGER,
                         account_id TEXT,
                         accts TEXT,
-                        created_at BIGINT
+                        created_at TIMESTAMPTZ
                     )
                     """
                 )
@@ -170,7 +212,7 @@ class PostgresDatabase(AsyncDatabase):
                         model_id TEXT NOT NULL,
                         kind TEXT NOT NULL,
                         payload TEXT NOT NULL,
-                        created_at DOUBLE PRECISION NOT NULL
+                        created_at TIMESTAMPTZ NOT NULL
                     )
                     """
                 )
@@ -185,7 +227,7 @@ class PostgresDatabase(AsyncDatabase):
                         ava BOOLEAN,
                         version INTEGER,
                         raw_data TEXT,
-                        created_at BIGINT
+                        created_at TIMESTAMPTZ
                     )
                     """
                 )
@@ -210,7 +252,7 @@ class PostgresDatabase(AsyncDatabase):
                             server TEXT,
                             encrypted_token TEXT,
                             is_local BOOLEAN,
-                            created_at BIGINT
+                            created_at TIMESTAMPTZ
                         )
                         """
                     )
@@ -225,7 +267,7 @@ class PostgresDatabase(AsyncDatabase):
                             prototype_id INTEGER,
                             chat_type TEXT,
                             carrier_user_id TEXT,
-                            created_at BIGINT,
+                            created_at TIMESTAMPTZ,
                             PRIMARY KEY (acct_id, chat_id)
                         )
                         """
@@ -238,7 +280,7 @@ class PostgresDatabase(AsyncDatabase):
                             acct_type TEXT,
                             state_key TEXT,
                             state_json TEXT,
-                            updated_at BIGINT,
+                            updated_at TIMESTAMPTZ,
                             PRIMARY KEY (acct_id, acct_type, state_key)
                         )
                         """
@@ -246,6 +288,20 @@ class PostgresDatabase(AsyncDatabase):
                     await conn.execute(
                         "CREATE INDEX IF NOT EXISTS idx_local_account_runtime_state_acct_id ON local_account_runtime_state(acct_id)"
                     )
+                for table, column in (
+                    ("models", "created_at"),
+                    ("inbound_pending", "created_at"),
+                    ("prototypes", "created_at"),
+                    ("files", "created_at"),
+                ):
+                    await _timestamptz(conn, table, column)
+                if self.enable_local_conductor:
+                    for table, column in (
+                        ("local_accounts", "created_at"),
+                        ("local_chats", "created_at"),
+                        ("local_account_runtime_state", "updated_at"),
+                    ):
+                        await _timestamptz(conn, table, column)
 
     async def wipe_all(self) -> None:
         tables = (
@@ -300,7 +356,7 @@ class PostgresDatabase(AsyncDatabase):
                 version,
                 account_id,
                 json.dumps(accts_obj),
-                int(time.time()),
+                instant.now(),
             )
 
     async def get_model(self, model_id: str) -> dict | None:
@@ -325,8 +381,41 @@ class PostgresDatabase(AsyncDatabase):
             "version": row["version"],
             "account_id": row["account_id"],
             "accts": accts,
-            "created_at": row["created_at"],
+            "created_at": instant.format(row["created_at"]),
         }
+
+    async def list_models(self) -> list[dict]:
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT model_id, prototype_id, conductor_addr, settings, version, account_id, accts, created_at
+                FROM models
+                """
+            )
+        out = []
+        for row in rows:
+            settings = ext_dict("model settings", json.loads(row["settings"])) if row["settings"] else {}
+            accts = ext_list("model accts", json.loads(row["accts"])) if row["accts"] else []
+            out.append({
+                "model_id": row["model_id"],
+                "prototype_id": row["prototype_id"],
+                "conductor_address": row["conductor_addr"],
+                "settings": settings,
+                "version": row["version"],
+                "account_id": row["account_id"],
+                "accts": accts,
+                "created_at": instant.format(row["created_at"]),
+            })
+        return out
+
+    async def update_model_secrets(self, model_id: str, *, settings, accts) -> None:
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE models SET settings = $1, accts = $2 WHERE model_id = $3",
+                json.dumps(settings),
+                json.dumps(accts),
+                model_id,
+            )
 
     async def update_model_conductor_addr(self, model_id: str, conductor_addr: str) -> bool:
         if not model_id:
@@ -365,6 +454,7 @@ class PostgresDatabase(AsyncDatabase):
         import asyncpg
 
         conn = await asyncpg.connect(self.dsn)
+        await _assume_station_owner(conn)
         try:
             return await fn(conn)
         finally:
@@ -374,7 +464,7 @@ class PostgresDatabase(AsyncDatabase):
         if not model_id:
             raise InternalError("missing_model_id")
         if created_at is None:
-            created_at = time.time()
+            created_at = instant.now()
         cols = ", ".join(FILE_COLUMNS)
         placeholders = ", ".join(f"${i}" for i in range(1, len(FILE_COLUMNS) + 1))
         values = (
@@ -446,15 +536,9 @@ class PostgresDatabase(AsyncDatabase):
 
     async def get_or_fetch_model(self, model_id: str, session, consul_url: str, token: str) -> dict | None:
         model = await self.get_model(model_id)
-        if not model:
-            remote = await fetch_model(session=session, consul_url=consul_url, token=token, model_id=model_id)
-            if remote:
-                await self.put_model(model_id, remote)
-                remote_model_id = remote.get("model_id")
-                if remote_model_id and remote_model_id != model_id:
-                    await self.put_model(remote_model_id, remote)
-                model = (await self.get_model(model_id)) or (await self.get_model(remote.get("model_id")))
-        return model
+        if model:
+            return model
+        return await fetch_and_apply_model(self, model_id, session, consul_url, token)
 
     async def put_prototype(self, data: dict) -> None:
         prototype_id = data.get("prototype_id")
@@ -489,7 +573,7 @@ class PostgresDatabase(AsyncDatabase):
                 ava,
                 version,
                 raw_data,
-                int(time.time()),
+                instant.now(),
             )
 
     async def get_prototype_info(self, prototype_id: int) -> dict | None:
@@ -532,7 +616,7 @@ class PostgresDatabase(AsyncDatabase):
                 model_id,
                 kind,
                 body,
-                time.time(),
+                instant.now(),
             )
 
     async def delete_inbound_pending(self, job_id: str) -> None:
@@ -569,7 +653,7 @@ class PostgresDatabase(AsyncDatabase):
                     "model_id": row["model_id"],
                     "kind": row["kind"],
                     "payload": ext_dict("inbound payload", json.loads(row["payload"])),
-                    "created_at": row["created_at"],
+                    "created_at": instant.format(row["created_at"]),
                 }
             )
         return out
@@ -632,7 +716,7 @@ class PostgresDatabase(AsyncDatabase):
                 server or None,
                 encrypted_token or None,
                 is_local,
-                int(time.time()),
+                instant.now(),
             )
 
     async def get_local_account(self, acct_id: str) -> dict | None:
@@ -684,6 +768,15 @@ class PostgresDatabase(AsyncDatabase):
             )
         return out
 
+    async def update_local_account_secret(self, acct_id: str, *, encrypted_token: str, server: str) -> None:
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE local_accounts SET encrypted_token = $1, server = $2 WHERE acct_id = $3",
+                encrypted_token,
+                server,
+                acct_id,
+            )
+
     async def delete_local_account(self, acct_id: str) -> None:
         if not acct_id:
             return
@@ -696,7 +789,7 @@ class PostgresDatabase(AsyncDatabase):
     async def replace_model_chats(self, *, model_id: str, prototype_id: int | None, chats: list[dict]) -> None:
         if not model_id:
             raise InternalError("model_id is required")
-        now = int(time.time())
+        now = instant.now()
         async with self.pool.acquire() as conn:
             async with conn.transaction():
                 await conn.execute("DELETE FROM local_chats WHERE model_id = $1", model_id)
@@ -764,7 +857,7 @@ class PostgresDatabase(AsyncDatabase):
                 prototype_id,
                 chat_type,
                 carrier_user_id or None,
-                int(time.time()),
+                instant.now(),
             )
 
     async def list_model_chats(self, *, model_id: str, acct_id: str | None = None) -> list[dict]:
@@ -880,7 +973,7 @@ class PostgresDatabase(AsyncDatabase):
                 acct_type,
                 state_key,
                 json.dumps(state),
-                int(time.time()),
+                instant.now(),
             )
 
     async def close(self) -> None:

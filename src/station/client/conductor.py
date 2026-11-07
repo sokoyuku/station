@@ -4,11 +4,15 @@ import os
 
 import aiohttp
 
-from station.client.context import update_client_context_prototype
 from station.client.retry import CircuitOpen, RetryableError, is_transient_status, retry_transient
 from station.conductor.platforms.policy import plan_outbound
+from station.database.consul_state import apply_consul_prototype, fetch_and_apply_model
+from station.errors import ExternalError
 from station import logger
 from station.prototypes.boundary import ext_dict, ext_int, ext_str
+from station.timeouts import BoundedSemaphore
+
+CONDUCTOR_TIMEOUT = aiohttp.ClientTimeout(total=300, connect=10, sock_connect=10, sock_read=300)
 
 _SUPPORTED_REPLY_METHODS = {
     "send_message",
@@ -40,7 +44,7 @@ def configure_outbound_concurrency(limit: int) -> None:
         _outbound_sem_limit = 0
         return
     if _outbound_sem is None or limit != _outbound_sem_limit:
-        _outbound_sem = asyncio.Semaphore(limit)
+        _outbound_sem = BoundedSemaphore(limit, where="conductor outbound")
         _outbound_sem_limit = limit
 
 def _outbound_semaphore() -> asyncio.Semaphore | None:
@@ -52,11 +56,7 @@ async def _sync_prototype_from_consul(ctx):
     from station.client.consul import fetch_prototype
 
     fetched = await fetch_prototype(session=ctx.session, consul_url=ctx.consul_url, token=ctx.token)
-    if not fetched:
-        return False
-    if ctx.db:
-        await ctx.db.put_prototype(fetched)
-    update_client_context_prototype(ctx, fetched)
+    await apply_consul_prototype(ctx.db, fetched, ctx)
     return True
 
 def _ext_addr(value, name):
@@ -85,6 +85,34 @@ async def _update_conductor_addr(ctx, model_id, conductor_address):
         ctx.conductor_addresses[model_id] = conductor_address
     if ctx.db:
         await ctx.db.update_model_conductor_addr(model_id, conductor_address)
+
+async def _conductor_address_from_consul(ctx, model_id, token, body):
+    hinted = _extract_conductor_address_from_491(body)
+    try:
+        if ctx.db:
+            remote = await fetch_and_apply_model(ctx.db, model_id, ctx.session, ctx.consul_url, token)
+        else:
+            from station.client.consul import fetch_model
+
+            remote = await fetch_model(session=ctx.session, consul_url=ctx.consul_url, token=token, model_id=model_id)
+    except ExternalError as e:
+        logger.error("conductor address refresh failed model_id=%s error=%s", model_id, e)
+        return ""
+    consul_addr = _ext_addr(remote.get("conductor_address"), "conductor_address")
+    if hinted and consul_addr and hinted != consul_addr:
+        logger.error(
+            "conductor address conflict model_id=%s consul=%s hinted=%s; using consul",
+            model_id,
+            consul_addr,
+            hinted,
+        )
+    if not consul_addr:
+        logger.error("consul model has empty conductor_address model_id=%s", model_id)
+        if ctx.conductor_addresses is not None and model_id:
+            ctx.conductor_addresses.pop(model_id, None)
+        return ""
+    await _update_conductor_addr(ctx, model_id, consul_addr)
+    return consul_addr
 
 async def _maybe_add_prototype_version_header(ctx, headers):
     version = ctx.prototype_version
@@ -155,15 +183,13 @@ async def _resolve_conductor_address(ctx, *, model_id, token):
         and token.strip()
         and model_id
     ):
-        from station.client.consul import fetch_model
-
-        remote = await fetch_model(session=ctx.session, consul_url=ctx.consul_url, token=token, model_id=model_id)
-        if remote is None:
-            logger.error("fetch_model failed error=none model_id=%s", model_id)
+        if ctx.db:
+            remote = await fetch_and_apply_model(ctx.db, model_id, ctx.session, ctx.consul_url, token)
         else:
-            conductor_address = _ext_addr(remote.get("conductor_address"), "conductor_address")
-            if conductor_address and ctx.db:
-                await ctx.db.put_model(model_id, remote)
+            from station.client.consul import fetch_model
+
+            remote = await fetch_model(session=ctx.session, consul_url=ctx.consul_url, token=token, model_id=model_id)
+        conductor_address = _ext_addr(remote.get("conductor_address"), "conductor_address")
 
     if not conductor_address:
         lc = _local_conductor(ctx)
@@ -256,7 +282,11 @@ async def _conductor_proxy(
         return False
 
     if not ctx.prototype_version:
-        await _sync_prototype_from_consul(ctx)
+        try:
+            await _sync_prototype_from_consul(ctx)
+        except ExternalError as e:
+            logger.error("conductor_proxy prototype sync failed method=%s error=%s", method, e)
+            return False
 
     local_result = await _invoke_local(
         ctx,
@@ -273,7 +303,11 @@ async def _conductor_proxy(
     if not ctx.session:
         return False
 
-    conductor_url = await _resolve_conductor_address(ctx, model_id=model_id, token=token)
+    try:
+        conductor_url = await _resolve_conductor_address(ctx, model_id=model_id, token=token)
+    except ExternalError as e:
+        logger.error("conductor_proxy address failed method=%s model_id=%s error=%s", method, model_id, e)
+        return False
     if not conductor_url:
         return False
 
@@ -300,7 +334,7 @@ async def _conductor_proxy(
                 headers = await _build_headers(ctx, token)
 
             async def _post():
-                async with ctx.session.post(url, headers=headers, **request_kwargs) as response:
+                async with ctx.session.post(url, headers=headers, timeout=CONDUCTOR_TIMEOUT, **request_kwargs) as response:
                     status = response.status
                     body = None
                     if status in (490, 491) or status >= 400:
@@ -323,14 +357,18 @@ async def _conductor_proxy(
                 logger.error("conductor_proxy failed method=%s error=%s", method, e)
                 return False
             if status == 490 and attempt == 0:
-                if await _sync_prototype_from_consul(ctx):
-                    continue
+                try:
+                    await _sync_prototype_from_consul(ctx)
+                except ExternalError as e:
+                    logger.error("conductor_proxy prototype sync failed method=%s error=%s", method, e)
+                    return False
+                continue
             if status == 491 and attempt == 0:
-                new_url = _extract_conductor_address_from_491(body)
+                new_url = await _conductor_address_from_consul(ctx, model_id, token, body)
                 if new_url:
-                    await _update_conductor_addr(ctx, model_id, new_url)
                     conductor_url = new_url
                     continue
+                return False
             if status >= 500:
                 logger.error("conductor_proxy failed method=%s status=%s", method, status)
                 return False
@@ -404,7 +442,11 @@ async def _gateway_file_transfer(
     if not acct_id:
         return None
 
-    conductor_url = await _resolve_conductor_address(ctx, model_id=model_id, token=token)
+    try:
+        conductor_url = await _resolve_conductor_address(ctx, model_id=model_id, token=token)
+    except ExternalError as e:
+        logger.error("%s address failed model_id=%s error=%s", error_label, model_id, e)
+        return None
     if not conductor_url:
         return None
 
@@ -417,7 +459,7 @@ async def _gateway_file_transfer(
         headers = await _build_headers(ctx, token)
 
         async def _post():
-            async with ctx.session.post(url, headers=headers, **request_kwargs) as response:
+            async with ctx.session.post(url, headers=headers, timeout=CONDUCTOR_TIMEOUT, **request_kwargs) as response:
                 status = response.status
                 if is_transient_status(status):
                     raise RetryableError("status=%s" % status)
@@ -437,14 +479,18 @@ async def _gateway_file_transfer(
             logger.error("%s failed error=%s", error_label, e)
             return None
         if status == 490:
-            if await _sync_prototype_from_consul(ctx):
-                continue
+            try:
+                await _sync_prototype_from_consul(ctx)
+            except ExternalError as e:
+                logger.error("%s prototype sync failed error=%s", error_label, e)
+                return None
+            continue
         if status == 491:
-            new_url = _extract_conductor_address_from_491(body)
+            new_url = await _conductor_address_from_consul(ctx, model_id, token, body)
             if new_url:
-                await _update_conductor_addr(ctx, model_id, new_url)
                 conductor_url = new_url
                 continue
+            return None
         if status >= 500:
             logger.error("%s failed status=%s", error_label, status)
             continue

@@ -1,10 +1,10 @@
 import sqlite3
 import json
-import time
 import os
 import shutil
 from contextlib import contextmanager
-from station.client.consul import fetch_model
+from station import instant
+from station.database.consul_state import fetch_and_apply_model
 from station.conductor.db_mixin import LocalConductorDatabaseMixin
 from station.database import AsyncDatabase
 from station.database.request_dedupe import run_in_db_executor, shared_dedupe_cache
@@ -82,7 +82,7 @@ class Database(LocalConductorDatabaseMixin, AsyncDatabase):
                         version INTEGER,
                         account_id TEXT,
                         accts TEXT,
-                        created_at INTEGER
+                        created_at TEXT
                     )
                 """)
                 conn.execute("DROP TABLE IF EXISTS requests")
@@ -92,7 +92,7 @@ class Database(LocalConductorDatabaseMixin, AsyncDatabase):
                         model_id TEXT NOT NULL,
                         kind TEXT NOT NULL,
                         payload TEXT NOT NULL,
-                        created_at REAL NOT NULL
+                        created_at TEXT NOT NULL
                     )
                 """)
                 conn.execute("""
@@ -105,7 +105,7 @@ class Database(LocalConductorDatabaseMixin, AsyncDatabase):
                         ava BOOLEAN,
                         version INTEGER,
                         raw_data TEXT,
-                        created_at INTEGER
+                        created_at TEXT
                     )
                 """)
                 conn.execute(FILES_TABLE_SQL_SQLITE)
@@ -115,6 +115,20 @@ class Database(LocalConductorDatabaseMixin, AsyncDatabase):
                     self._init_local_conductor_db(conn)
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_inbound_pending_model_id ON inbound_pending(model_id)")
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_inbound_pending_created_at ON inbound_pending(created_at)")
+                for table, column in (
+                    ("models", "created_at"),
+                    ("inbound_pending", "created_at"),
+                    ("prototypes", "created_at"),
+                    ("files", "created_at"),
+                ):
+                    instant.rewrite_sqlite(conn, table, column)
+                if self.enable_local_conductor:
+                    for table, column in (
+                        ("local_accounts", "created_at"),
+                        ("local_chats", "created_at"),
+                        ("local_account_runtime_state", "updated_at"),
+                    ):
+                        instant.rewrite_sqlite(conn, table, column)
         except Exception as e:
             logger.error("database start failed error=%s", e, exc_info=e)
             raise
@@ -123,7 +137,8 @@ class Database(LocalConductorDatabaseMixin, AsyncDatabase):
         if not model_id:
             raise InternalError("missing_model_id")
         if created_at is None:
-            created_at = time.time()
+            created_at = instant.now()
+        created_at = instant.format(created_at)
         try:
             with self._connect() as conn:
                 conn.execute(
@@ -200,7 +215,7 @@ class Database(LocalConductorDatabaseMixin, AsyncDatabase):
             version,
             account_id,
             json.dumps(accts_obj),
-            time.time(),
+            instant.format(instant.now()),
         )
 
         def _sync():
@@ -240,6 +255,42 @@ class Database(LocalConductorDatabaseMixin, AsyncDatabase):
                 }
 
         return await run_in_db_executor(_sync)
+
+    async def list_models(self):
+        def _sync():
+            with self._connect() as conn:
+                rows = conn.execute(
+                    "SELECT model_id, prototype_id, conductor_addr, settings, version, account_id, accts, created_at FROM models"
+                ).fetchall()
+            out = []
+            for row in rows:
+                settings = ext_dict("model settings", json.loads(row[3])) if row[3] else {}
+                accts = ext_list("model accts", json.loads(row[6])) if row[6] else []
+                out.append({
+                    "model_id": row[0],
+                    "prototype_id": row[1],
+                    "conductor_address": row[2],
+                    "settings": settings,
+                    "version": row[4],
+                    "account_id": row[5],
+                    "accts": accts,
+                    "created_at": row[7],
+                })
+            return out
+
+        return await run_in_db_executor(_sync)
+
+    async def update_model_secrets(self, model_id, *, settings, accts):
+        payload = (json.dumps(settings), json.dumps(accts), model_id)
+
+        def _sync():
+            with self._connect() as conn:
+                conn.execute(
+                    "UPDATE models SET settings = ?, accts = ? WHERE model_id = ?",
+                    payload,
+                )
+
+        await run_in_db_executor(_sync)
 
     async def update_model_conductor_addr(self, model_id, conductor_addr):
         if not model_id:
@@ -289,7 +340,7 @@ class Database(LocalConductorDatabaseMixin, AsyncDatabase):
             ava,
             version,
             raw_data,
-            time.time(),
+            instant.format(instant.now()),
         )
 
         def _sync():
@@ -334,7 +385,7 @@ class Database(LocalConductorDatabaseMixin, AsyncDatabase):
     async def put_inbound_pending(self, *, job_id: str, model_id: str, kind: str, payload: dict) -> None:
         if not job_id or not model_id or not kind:
             raise InternalError("inbound_pending requires job_id, model_id, and kind")
-        now = time.time()
+        now = instant.format(instant.now())
         body = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
 
         def _put():
@@ -404,15 +455,9 @@ class Database(LocalConductorDatabaseMixin, AsyncDatabase):
 
     async def get_or_fetch_model(self, model_id, session, consul_url, token):
         model = await self.get_model(model_id)
-        if not model:
-            remote = await fetch_model(session=session, consul_url=consul_url, token=token, model_id=model_id)
-            if remote:
-                await self.put_model(model_id, remote)
-                remote_model_id = remote.get("model_id")
-                if remote_model_id and remote_model_id != model_id:
-                    await self.put_model(remote_model_id, remote)
-                model = (await self.get_model(model_id)) or (await self.get_model(remote.get("model_id")))
-        return model
+        if model:
+            return model
+        return await fetch_and_apply_model(self, model_id, session, consul_url, token)
 
     async def ensure_model_lock(self, app, model_id: str) -> bool:
         return True

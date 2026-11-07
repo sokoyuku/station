@@ -1,3 +1,4 @@
+import asyncio
 import json
 import os
 import tempfile
@@ -5,12 +6,16 @@ import time
 import uuid
 from aiohttp import web
 from aiohttp.web_request import FileField
-from station.client.context import update_client_context_prototype
+from station.database.consul_state import apply_consul_prototype, fetch_and_apply_model
 from station.api.instances import (
+    MODEL_START_FAILED_REPLY,
+    PROTOTYPE_FAILED_REPLY,
     create_tenant_instance,
+    instance_kind,
     isolate_instance,
     note_instance_ok,
     note_instance_unexpected,
+    precheck_prototype,
     should_isolate,
 )
 from station.api.tenant_auth import authorize_request
@@ -30,6 +35,25 @@ def _same_prototype(instance, tenant_id) -> bool:
 
 def relay_error(*, reason, msg, status, retryable=None):
     raise ExternalError(msg, status=status, reason=reason, retryable=retryable)
+
+async def _load_model(db, model_id, session, consul_url, token, tenant_id):
+    model = await db.get_model(model_id)
+    if model is None:
+        return await fetch_and_apply_model(db, model_id, session, consul_url, token)
+    if model.get("prototype_id") == tenant_id:
+        return model
+    logger.error(
+        "model prototype conflict model_id=%s local=%s tenant=%s; fetching consul",
+        model_id,
+        model.get("prototype_id"),
+        tenant_id,
+    )
+    try:
+        return await fetch_and_apply_model(db, model_id, session, consul_url, token)
+    except ExternalError as e:
+        if e.status == 404:
+            return model
+        raise
 
 def is_slash_command(text):
     t = text.strip()
@@ -112,21 +136,65 @@ def _instance_delivery_rejection_response(result):
         return relay_error(reason="", msg="message queue is full", status=503, retryable=True)
     return None
 
-async def _start_instance(*, app, instance, model_id):
+def _quiet_ok():
+    return web.json_response({"result": 0, "msg": "ok", "data": None})
+
+async def _reply_prototype_failed(app, tenant, *, model_id, chat_id, acct_id):
+    if not chat_id or not acct_id:
+        return
+    instance = create_tenant_instance(
+        app,
+        tenant,
+        prototype_id=tenant.id,
+        model_id=model_id,
+        model_settings={},
+    )
+    try:
+        await instance.send_outbound(
+            text=PROTOTYPE_FAILED_REPLY,
+            chat_id=chat_id,
+            acct_id=acct_id,
+        )
+    except Exception as e:
+        logger.error("unexpected where=prototype_failed_reply prototype_id=%s error=%s", tenant.id, e, exc_info=e)
+
+async def _reply_model_start_failed(instance, *, chat_id, acct_id):
+    if not chat_id or not acct_id:
+        return
+    try:
+        await instance.send_outbound(
+            text=MODEL_START_FAILED_REPLY,
+            chat_id=chat_id,
+            acct_id=acct_id,
+        )
+    except Exception as e:
+        logger.error("unexpected where=model_start_failed_reply model_id=%s error=%s", instance.model_id, e, exc_info=e)
+
+async def _start_instance(*, app, instance, model_id, chat_id="", acct_id=""):
     try:
         await instance.start()
-    except ExternalError as e:
-        await isolate_instance(app, model_id, instance)
-        raise ExternalError(str(e), status=400, reason="invalid_request")
-    except Exception as e:
-        log_caught(logger, e, where="reception start_instance model_id=%s" % model_id)
-        await isolate_instance(app, model_id, instance)
+    except asyncio.CancelledError:
         raise
+    except Exception as e:
+        kind = instance_kind(app, instance)
+        logger.error(
+            "instance start failed prototype_id=%s model_id=%s kind=%s error=%s",
+            instance.prototype_id,
+            model_id,
+            kind,
+            e,
+        )
+        await _reply_model_start_failed(instance, chat_id=chat_id, acct_id=acct_id)
+        await isolate_instance(app, model_id, instance)
+        return _quiet_ok()
     return None
 
 async def _deliver(*, app, instance, model_id, deliver):
     try:
         result = await deliver()
+    except ExternalError as e:
+        log_caught(logger, e, where="reception deliver model_id=%s" % model_id)
+        raise
     except Exception as e:
         log_caught(logger, e, where="reception deliver model_id=%s" % model_id)
         count = note_instance_unexpected(app, model_id)
@@ -145,8 +213,9 @@ async def _check_or_sync_prototype_version(request, app, tenant):
         raise ExternalError("Synchronize from consul", status=490)
     try:
         incoming_version = ext_path_int("X-Prototype-Version", incoming_version_raw)
-    except ExternalError:
-        raise ExternalError("Synchronize from consul", status=490)
+    except ExternalError as e:
+        logger.error("prototype version invalid error=%s", e)
+        raise ExternalError("Synchronize from consul", status=490) from e
 
     ctx = tenant.client_context
     if ctx is not None and ctx.prototype_version is not None:
@@ -169,14 +238,20 @@ async def _check_or_sync_prototype_version(request, app, tenant):
     consul_url = config.consul_url
     token = tenant.token_state.token
     from station.client.consul import fetch_prototype
-    fetched = await fetch_prototype(session=session, consul_url=consul_url, token=token)
-    if fetched:
-        await db.put_prototype(fetched)
-        if ctx is not None:
-            update_client_context_prototype(ctx, fetched)
-            local_version = 0 if ctx.prototype_version is None else ctx.prototype_version
-        else:
-            local_version = 0 if fetched.get("version") is None else fetched["version"]
+    try:
+        fetched = await fetch_prototype(session=session, consul_url=consul_url, token=token)
+    except ExternalError as e:
+        return relay_error(
+            reason=e.reason or "consul_request",
+            msg=str(e),
+            status=e.status or 502,
+            retryable=True if e.retryable is None else e.retryable,
+        )
+    await apply_consul_prototype(db, fetched, ctx)
+    if ctx is not None and ctx.prototype_version is not None:
+        local_version = ctx.prototype_version
+    else:
+        local_version = 0 if fetched.get("version") is None else fetched["version"]
     if local_version == incoming_version:
         return None
 
@@ -238,6 +313,11 @@ async def _handle_reception(request):
         dedupe_key = f"{model_id}:{request_id}"
         if await db.is_duplicate_request(dedupe_key):
             return web.json_response({"result": 0, "msg": "Duplicate", "data": None}, status=200)
+    if not await precheck_prototype(app, tenant.id):
+        await _reply_prototype_failed(app, tenant, model_id=model_id, chat_id=chat_id, acct_id=acct_id)
+        if dedupe_key:
+            await db.remember_request(dedupe_key)
+        return _quiet_ok()
 
     if request.content_type and request.content_type.startswith("multipart/"):
         form = await request.post()
@@ -303,11 +383,16 @@ async def _handle_reception(request):
     if instance is not None and _same_prototype(instance, tenant.id):
         settings = instance.model_settings
         if not instance._started:
-            start_resp = await _start_instance(app=app, instance=instance, model_id=model_id)
+            start_resp = await _start_instance(app=app, instance=instance, model_id=model_id, chat_id=chat_id, acct_id=acct_id)
             if start_resp is not None:
                 return start_resp
     else:
-        model = await db.get_or_fetch_model(model_id, session, consul_url, token)
+        try:
+            model = await _load_model(db, model_id, session, consul_url, token, tenant.id)
+        except ExternalError as e:
+            if e.status == 404:
+                return relay_error(reason="model_not_found", msg="Model not found", status=404)
+            raise
         if not model:
             return relay_error(reason="model_not_found", msg="Model not found", status=404)
 
@@ -336,11 +421,11 @@ async def _handle_reception(request):
                 created = True
 
         if created:
-            start_resp = await _start_instance(app=app, instance=instance, model_id=model_id)
+            start_resp = await _start_instance(app=app, instance=instance, model_id=model_id, chat_id=chat_id, acct_id=acct_id)
             if start_resp is not None:
                 return start_resp
         elif not instance._started:
-            start_resp = await _start_instance(app=app, instance=instance, model_id=model_id)
+            start_resp = await _start_instance(app=app, instance=instance, model_id=model_id, chat_id=chat_id, acct_id=acct_id)
             if start_resp is not None:
                 return start_resp
 
@@ -404,6 +489,8 @@ async def handle_event(request):
         return relay_error(reason="invalid_request", msg="chat_id must be empty for acct-level event", status=400)
     if event_level == "chat" and not chat_id:
         return relay_error(reason="invalid_request", msg="Missing chat_id for chat-level event", status=400)
+    if not await precheck_prototype(app, tenant.id):
+        return _quiet_ok()
     model_id = request.headers.get("X-Model-Id", model_id)
 
     dedupe_key = ""
@@ -416,8 +503,12 @@ async def handle_event(request):
 
     session = app["session"]
     consul_url = config.consul_url
-    model = await db.get_or_fetch_model(model_id, session, consul_url, token)
-
+    try:
+        model = await _load_model(db, model_id, session, consul_url, token, tenant.id)
+    except ExternalError as e:
+        if e.status == 404:
+            return relay_error(reason="model_not_found", msg="Model not found", status=404)
+        raise
     if not model:
         return relay_error(reason="model_not_found", msg="Model not found", status=404)
 
@@ -450,11 +541,11 @@ async def handle_event(request):
             created = True
 
     if created:
-        start_resp = await _start_instance(app=app, instance=instance, model_id=model_id)
+        start_resp = await _start_instance(app=app, instance=instance, model_id=model_id, chat_id=chat_id, acct_id=acct_id)
         if start_resp is not None:
             return start_resp
     elif not instance._started:
-        start_resp = await _start_instance(app=app, instance=instance, model_id=model_id)
+        start_resp = await _start_instance(app=app, instance=instance, model_id=model_id, chat_id=chat_id, acct_id=acct_id)
         if start_resp is not None:
             return start_resp
 

@@ -1,4 +1,89 @@
+import asyncio
+
 from station import logger
+
+MODEL_START_FAILED_REPLY = "The model had issues, please try later."
+PROTOTYPE_FAILED_REPLY = "The prototype had issues. You can reach this prototype's support for support. It is shown in the prototype details."
+
+class ModelStartError(Exception):
+    pass
+
+def prototype_start_failed(app, prototype_id):
+    failed = app.get("prototype_start_failed")
+    return failed is not None and prototype_id in failed
+
+async def precheck_prototype(app, prototype_id):
+    ready = app.setdefault("prototype_start_ready", set())
+    failed = app.setdefault("prototype_start_failed", set())
+    if prototype_id in ready:
+        return True
+    if prototype_id in failed:
+        return False
+    lock = app.setdefault("_prototype_precheck_lock", asyncio.Lock())
+    async with lock:
+        if prototype_id in ready:
+            return True
+        if prototype_id in failed:
+            return False
+        registry = app.get("tenants")
+        tenant = None if registry is None else registry.get(prototype_id)
+        if tenant is None:
+            failed.add(prototype_id)
+            logger.error("prototype start skipped prototype_id=%s", prototype_id)
+            return False
+        instance = create_tenant_instance(
+            app,
+            tenant,
+            prototype_id=prototype_id,
+            model_id="precheck-%s" % prototype_id,
+            model_settings={},
+        )
+        try:
+            await instance.start()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            failed.add(prototype_id)
+            logger.error(
+                "prototype start failed prototype_id=%s kind=%s error=%s",
+                prototype_id,
+                tenant.kind,
+                e,
+            )
+            if tenant.kind == "cursor":
+                logger.error("cursor start skipped prototype_id=%s", prototype_id)
+            else:
+                logger.error("prototype start skipped prototype_id=%s kind=%s", prototype_id, tenant.kind)
+            try:
+                await instance.stop()
+            except Exception as stop_error:
+                logger.error(
+                    "unexpected where=prototype_precheck_stop prototype_id=%s error=%s",
+                    prototype_id,
+                    stop_error,
+                    exc_info=stop_error,
+                )
+            return False
+        ready.add(prototype_id)
+        try:
+            await instance.stop()
+        except Exception as stop_error:
+            logger.error(
+                "unexpected where=prototype_precheck_stop prototype_id=%s error=%s",
+                prototype_id,
+                stop_error,
+                exc_info=stop_error,
+            )
+        return True
+
+def instance_kind(app, instance):
+    registry = app.get("tenants")
+    if registry is None:
+        return ""
+    tenant = registry.get(instance.prototype_id)
+    if tenant is None:
+        return ""
+    return tenant.kind
 
 def create_tenant_instance(app, tenant, *, prototype_id, model_id, model_settings=None):
     cls = tenant.prototype_class

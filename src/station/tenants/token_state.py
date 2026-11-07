@@ -1,14 +1,14 @@
-import asyncio
 import time
 
 from station.errors import ExternalError
+from station.timeouts import BoundedLock
 
 class TokenState:
     def __init__(self, token: str):
         self.token = (token or "").strip()
         self.previous_token: str | None = None
         self.previous_token_expires_at: float | None = None
-        self.lock = asyncio.Lock()
+        self.lock = BoundedLock(where="tenant token")
 
     def is_authorized(self, header_token: str) -> bool:
         header_token = (header_token or "").strip()

@@ -1,9 +1,9 @@
-import asyncio
 import ctypes
 import os
 import signal
 
 from station import logger
+from station.timeouts import DeadlineExceeded, wait
 
 PR_SET_PDEATHSIG = 1
 
@@ -67,9 +67,21 @@ class GatewayProcessRegistry:
             )
             proc.terminate()
             try:
-                await asyncio.wait_for(proc.wait(), timeout=terminate_timeout_s)
-            except asyncio.TimeoutError:
+                await wait(proc.wait(), terminate_timeout_s, "gateway terminate")
+            except DeadlineExceeded:
+                logger.error(
+                    "gateway did not exit after terminate kind=%s model_id=%s pid=%s; killing",
+                    entry["kind"],
+                    entry["model_id"],
+                    pid,
+                )
                 proc.kill()
-                await proc.wait()
-            except ProcessLookupError:
-                pass
+                await wait(proc.wait(), terminate_timeout_s, "gateway kill")
+            except ProcessLookupError as exc:
+                logger.info(
+                    "gateway already exited kind=%s model_id=%s pid=%s error=%s",
+                    entry["kind"],
+                    entry["model_id"],
+                    pid,
+                    exc,
+                )

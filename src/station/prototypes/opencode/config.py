@@ -1,5 +1,6 @@
 import json
 import os
+import shlex
 import shutil
 from dataclasses import dataclass
 
@@ -38,9 +39,13 @@ def _usable_linux_opencode(path):
     return resolved
 
 def _resolve_opencode_command(server):
-    explicit = ext_mapping_get(server, "command", (list,), None, allow_none=True)
-    if explicit:
-        explicit = parse_command_args(explicit, "server.command")
+    raw = ext_mapping_get(server, "command", (str, list), None, allow_none=True)
+    explicit = None
+    if isinstance(raw, str):
+        if raw.strip():
+            explicit = shlex.split(raw)
+    elif raw:
+        explicit = parse_command_args(raw, "server.command")
 
     if explicit:
         if is_windows_interop_path(explicit[0]):
@@ -78,45 +83,48 @@ def write_local_llm_opencode_config(path, *, settings):
     model_id = settings.model or "default"
     provider_id = settings.gateway_provider()
     api_key = settings.local_llm_api_key or "local"
-    model_entry = {
-        "name": model_id.rsplit("/", 1)[-1],
-        "tool_call": True,
-        "reasoning": False,
-        "attachment": False,
-        "limit": {
-            "context": settings.local_llm_context_window or 32768,
-            "output": settings.local_llm_max_output or 8192,
-        },
+    model_name = model_id.rsplit("/", 1)[-1]
+    limit = {
+        "context": settings.local_llm_context_window or 32768,
+        "output": settings.local_llm_max_output or 8192,
     }
     payload = {
         "$schema": "https://opencode.ai/config.json",
         "model": "%s/%s" % (provider_id, model_id),
-        "provider": {
+        "providers": {
             provider_id: {
-                "npm": "@ai-sdk/openai-compatible",
+                "package": "aisdk:@ai-sdk/openai-compatible",
                 "name": "Local LLM",
-                "key": api_key,
-                "options": {
-                    "name": provider_id,
+                "settings": {
                     "baseURL": settings.local_llm_base_url,
                     "apiKey": api_key,
                     "chat_template_kwargs": {"enable_thinking": False},
                 },
                 "models": {
-                    model_id: model_entry,
+                    model_id: {
+                        "name": model_name,
+                        "capabilities": {
+                            "tools": True,
+                            "input": ["text"],
+                            "output": ["text"],
+                        },
+                        "limit": limit,
+                    },
                 },
             }
         },
-        "permission": {"*": "allow"},
+        "permissions": [
+            {"action": "*", "resource": "*", "effect": "allow"},
+        ],
     }
     extra = dict(settings.opencode_overrides or {})
-    extra_provider = extra.pop("provider", None)
+    extra_providers = extra.pop("providers", None)
     payload.update(extra)
-    if extra_provider is not None:
-        extra_provider = ext_dict("opencode provider override", extra_provider)
-        merged = dict(payload.get("provider") or {})
-        merged.update(extra_provider)
-        payload["provider"] = merged
+    if extra_providers is not None:
+        extra_providers = ext_dict("opencode providers override", extra_providers)
+        merged = dict(payload.get("providers") or {})
+        merged.update(extra_providers)
+        payload["providers"] = merged
     write_atomic(path, json.dumps(payload, indent=2, ensure_ascii=False) + "\n")
     return path
 
@@ -269,9 +277,3 @@ class OpenCodeLaunchSettings:
         if self.variant:
             payload["variant"] = self.variant
         return payload
-
-    def message_model_payload(self):
-        provider = self.gateway_provider()
-        if not self.model or not provider:
-            return None
-        return {"providerID": provider, "modelID": self.model}

@@ -4,6 +4,7 @@ from .webrtc import handle_webrtc_offer
 from .token import handle_admin_update_prototype_token, handle_admin_add_prototype
 from .reload import handle_admin_reload_config
 from .memory_admin import handle_admin_memory
+from .voice_inject import handle_admin_inject_voice_pcm
 from station import hopmetrics
 from .model import (
     handle_reload_model,
@@ -40,3 +41,4 @@ class Routes:
         app.router.add_post("/admin/prototype", handle_admin_add_prototype)
         app.router.add_post("/admin/reload_config", handle_admin_reload_config)
         app.router.add_post("/admin/memory/{model_id}", handle_admin_memory)
+        app.router.add_post("/admin/inject_voice_pcm", handle_admin_inject_voice_pcm)

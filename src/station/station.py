@@ -3,7 +3,8 @@ import os
 import signal
 import aiohttp
 from aiohttp import web
-from station.client.context import ClientContext, update_client_context_prototype
+from station.client.context import ClientContext
+from station.database.consul_state import apply_consul_prototype
 from station.client.conductor import configure_outbound_concurrency
 from station.client.retry import apply_retry_config
 from station.config.config import Config
@@ -17,6 +18,7 @@ from station.recorder import Recorder, setup_recorder_routes
 from station.conductor.handlers import ensure_local_conductor
 from station.gateway_processes import GatewayProcessRegistry
 from station.tenants import Tenant, TenantRegistry, TokenState
+from station.timeouts import BoundedLock, http_timeout
 from station.prototypes.registry import register_kind
 
 from station import logger
@@ -126,16 +128,18 @@ class Station:
         )
 
     async def _fetch_prototype_with_retry(self, session, consul_url, token):
+        last = None
         for _ in range(8):
-            fetched_data = await fetch_prototype(
-                session=session,
-                consul_url=consul_url,
-                token=token,
-            )
-            if fetched_data:
-                return True, ext_dict("fetch_prototype data", fetched_data)
-            await asyncio.sleep(0.25)
-        return False, {}
+            try:
+                return await fetch_prototype(
+                    session=session,
+                    consul_url=consul_url,
+                    token=token,
+                )
+            except ExternalError as e:
+                last = e
+                await asyncio.sleep(0.25)
+        raise last
 
     def _make_session(self):
         out_limit = self.config.server.outbound_concurrency
@@ -152,6 +156,7 @@ class Station:
                 ttl_dns_cache=300,
                 enable_cleanup_closed=True,
             ),
+            timeout=http_timeout(),
             trust_env=False,
         )
 
@@ -264,11 +269,9 @@ class Station:
                 raise ExternalError("prototypes[0].token is required")
 
             session = self._make_session()
-            primary_fetched_ok, primary_fetched = await self._fetch_prototype_with_retry(
+            primary_fetched = await self._fetch_prototype_with_retry(
                 session, consul_url, primary_token
             )
-            if not primary_fetched_ok:
-                raise ExternalError("fetch_prototype failed (consul_url=%s)" % consul_url)
 
             if primary_fetched.get("prototype_id") is not None:
                 self.prototype_id = ext_int("prototype_id", primary_fetched["prototype_id"])
@@ -348,9 +351,7 @@ class Station:
                     fetched = primary_fetched
                     is_local = primary_is_local
                 else:
-                    fetched_ok, fetched = await self._fetch_prototype_with_retry(session, consul_url, token)
-                    if not fetched_ok:
-                        raise ExternalError("fetch_prototype failed for prototype_id=%s" % pid)
+                    fetched = await self._fetch_prototype_with_retry(session, consul_url, token)
                     if fetched.get("prototype_id") is not None:
                         pid = ext_int("prototype_id", fetched["prototype_id"])
                         cfg.id = pid
@@ -374,8 +375,7 @@ class Station:
                     db=self.db,
                     app=self.app,
                 )
-                update_client_context_prototype(client_context, fetched)
-                await self.db.put_prototype(fetched)
+                await apply_consul_prototype(self.db, fetched, client_context)
 
                 tenant = Tenant(
                     id=pid,
@@ -404,7 +404,7 @@ class Station:
             self.app["_local_conductor_routes"] = False
             ensure_local_conductor(self.app)
             self.app["instances"] = {}
-            self.app["instance_lock"] = asyncio.Lock()
+            self.app["instance_lock"] = BoundedLock(where="instance")
             self.app["instance_runtime"] = {}
             self.app["gateway_processes"] = GatewayProcessRegistry()
 

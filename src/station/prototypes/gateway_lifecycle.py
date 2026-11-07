@@ -1,17 +1,22 @@
 import asyncio
 
+from station.timeouts import BoundedLock
+
 from station import logger
 
 class PrototypeGateway:
     def _init_gateway_lifecycle(self):
         self._gateway = None
         self._settings = None
-        self._gateway_lock = asyncio.Lock()
+        self._gateway_lock = BoundedLock(where="gateway")
         self._gateway_pid = None
 
     async def start(self):
         await super().start()
+
+    async def _start_body(self):
         await self._ensure_gateway()
+        await super()._start_body()
 
     async def stop(self):
         await self._teardown_gateway()

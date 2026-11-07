@@ -30,6 +30,9 @@ class PrototypeFS:
     def save_temp(self, **kwargs):
         return self.fs.save_temp(**kwargs)
 
+    def save_chat(self, **kwargs):
+        return self.fs.save_chat(**kwargs)
+
     def rewrite_inbound_attachments(self, body, *, chat_id=None, acct_id=None):
         return self.fs.rewrite_inbound_attachments(body, chat_id=chat_id, acct_id=acct_id)
 

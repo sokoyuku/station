@@ -57,6 +57,23 @@ def write_private_key(path: str, key: rsa.RSAPrivateKey) -> None:
         f.write(raw)
     os.chmod(path, 0o600)
 
+def encrypt_with_public_key(pub: rsa.RSAPublicKey, plaintext: str) -> str:
+    key = os.urandom(32)
+    nonce = os.urandom(12)
+    enc_key = pub.encrypt(
+        key,
+        padding.OAEP(mgf=padding.MGF1(algorithm=hashes.SHA256()), algorithm=hashes.SHA256(), label=None),
+    )
+    ciphertext = AESGCM(key).encrypt(nonce, plaintext.encode("utf-8"), None)
+    payload = {
+        "v": 1,
+        "k": b64url_encode(enc_key),
+        "n": b64url_encode(nonce),
+        "c": b64url_encode(ciphertext),
+    }
+    raw = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    return ENCRYPTED_TOKEN_PREFIX + b64url_encode(raw)
+
 def decrypt_if_encrypted(priv: rsa.RSAPrivateKey | None, token: str) -> tuple[str, bool]:
     token = (token or "").strip()
     if not token.startswith(ENCRYPTED_TOKEN_PREFIX):

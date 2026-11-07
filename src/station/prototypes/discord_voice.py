@@ -65,8 +65,9 @@ class PrototypeDiscordVoice:
             channel_id = chat_id
         platform = ext_str("platform", chat_opened.get("platform"), default="discord") or "discord"
         chat_type = _chat_type_from_opened(chat_opened)
-        if not await self._call_support_enabled():
-            if channel_id:
+        state = await self._call_support_state()
+        if state is not True:
+            if state is False and channel_id:
                 await self.send_outbound(
                     text="This model does not support voice calls. Continuing as a text channel.",
                     chat_id=channel_id,

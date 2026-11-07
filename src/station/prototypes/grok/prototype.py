@@ -2,16 +2,19 @@ import asyncio
 
 from station.prototypes.attachments import find_audio_attachment, find_image_attachment
 from station.prototypes.boundary import validate_inbound_message_fields
-from station.prototypes.chat_history import note_chat_opened
+from station.prototypes.chat_history import history_sender, note_chat_opened, persisted_attachment_records
 from station.prototypes.model_config import PrototypeModelConfig, load_overlay
 from station.prototypes.prototype import Prototype
+from station.timeouts import BoundedLock
 
 from .auth_flow import GrokAuthFlow
 from .config import GrokLaunchSettings
+from .hermes_supervisor import GrokHermesSupervisor
+from .mention import group_starts_turn, inbound_history_text
 from .turn import GrokTurn
 from .voice_bridge import GrokVoiceBridge
 
-class GrokPrototype(PrototypeModelConfig, GrokAuthFlow, GrokVoiceBridge, GrokTurn, Prototype):
+class GrokPrototype(GrokHermesSupervisor, PrototypeModelConfig, GrokAuthFlow, GrokVoiceBridge, GrokTurn, Prototype):
     def __init__(self, app, prototype_id, model_id, model_settings=None, *, config_file=None, secret_file=None):
         super().__init__(
             app,
@@ -21,11 +24,12 @@ class GrokPrototype(PrototypeModelConfig, GrokAuthFlow, GrokVoiceBridge, GrokTur
             config_file=config_file,
             secret_file=secret_file,
         )
-        self._active_chat_requests = set()
+        self._turn_active = False
+        self._turn_scheduled = False
         self._init_device_auth()
         self._realtime_by_call = {}
         self._realtime_by_chat = {}
-        self._realtime_guard = asyncio.Lock()
+        self._realtime_guard = BoundedLock(where="grok realtime")
 
     def _build_settings(self, model_settings=None):
         raw = self.model_settings if model_settings is None else model_settings
@@ -138,10 +142,47 @@ class GrokPrototype(PrototypeModelConfig, GrokAuthFlow, GrokVoiceBridge, GrokTur
         )
         return True
 
+    async def _feed_live_text(self, ctx):
+        text = (ctx.text or "").strip()
+        if not text:
+            return
+        state = await self._active_realtime_for_chat(ctx.chat_id)
+        if state is None:
+            return
+        await state.session.send_text(text)
+
+    async def _handle_inbound_setup(self, ctx):
+        if not group_starts_turn(ctx):
+            return False
+        return await super()._handle_inbound_setup(ctx)
+
     async def _handle_inbound_context(self, ctx):
         photo_attachment = find_image_attachment(ctx.attachments)
         voice_attachment = find_audio_attachment(ctx.attachments)
-
+        attachment_records = persisted_attachment_records(ctx.attachments)
+        history_text = inbound_history_text(
+            ctx.text,
+            attachments=attachment_records,
+            photo=photo_attachment is not None,
+            audio=voice_attachment is not None,
+        )
+        starts_turn = group_starts_turn(ctx)
+        if history_text:
+            async with self._queue_lock():
+                self._append_user_turn(
+                    acct_id=ctx.acct_id,
+                    chat_id=ctx.chat_id,
+                    user_text=history_text,
+                    attachments=attachment_records,
+                    sender=history_sender(ctx.user_id, ctx.sender),
+                    platform=ctx.platform,
+                    chat_type=ctx.chat_type,
+                    unread=True,
+                    starts_turn=starts_turn,
+                )
+        if not starts_turn:
+            await self._feed_live_text(ctx)
+            return
         await self._run_chat_turn(
             chat_id=ctx.chat_id,
             acct_id=ctx.acct_id,
@@ -154,4 +195,7 @@ class GrokPrototype(PrototypeModelConfig, GrokAuthFlow, GrokVoiceBridge, GrokTur
             chat_type=ctx.chat_type,
             user_id=ctx.user_id,
             sender=ctx.sender,
+            user_recorded=bool(history_text),
+            attachment_records=attachment_records,
+            from_queue=True,
         )

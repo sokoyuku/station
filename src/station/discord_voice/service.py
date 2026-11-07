@@ -11,6 +11,7 @@ import aiohttp
 from station import logger
 from station.errors import ExternalError
 from station.prototypes.boundary import ext_dict, ext_float, ext_int, ext_list, ext_str
+from station.timeouts import IO_TIMEOUT_S, BoundedLock, wait, ws_timeout
 
 def pcm_stereo_to_mono(pcm_stereo):
     if not pcm_stereo:
@@ -58,7 +59,7 @@ class DiscordVoiceConnection:
         self._decoders = {}
         self._lock = threading.Lock()
         self._out_queue = deque()
-        self._out_lock = asyncio.Lock()
+        self._out_lock = BoundedLock(where="discord voice out")
         self._speaking = False
         self.on_audio_in = None
         self.on_ready = None
@@ -99,7 +100,7 @@ class DiscordVoiceConnection:
         elif host.startswith("127.") or host.startswith("localhost") or host.startswith("0.0.0.0"):
             scheme = "ws"
         url = f"{scheme}://{host}/?v=4"
-        self._ws = await self._http.ws_connect(url, heartbeat=None)
+        self._ws = await self._http.ws_connect(url, heartbeat=None, timeout=ws_timeout())
         self._tasks.append(asyncio.create_task(self._ws_loop()))
 
     async def stop(self):
@@ -140,8 +141,14 @@ class DiscordVoiceConnection:
                 if msg.type == aiohttp.WSMsgType.TEXT:
                     try:
                         data = json.loads(msg.data)
-                    except json.JSONDecodeError:
-                        continue
+                    except json.JSONDecodeError as exc:
+                        logger.error(
+                            "discord voice malformed JSON guild_id=%s channel_id=%s error=%s",
+                            self.guild_id,
+                            self.channel_id,
+                            exc,
+                        )
+                        raise ExternalError("discord voice malformed JSON") from exc
                     data = ext_dict('discord voice ws message', data)
                     try:
                         await self._handle_ws(data)
@@ -390,8 +397,8 @@ class DiscordVoiceConnection:
             else:
                 return None, None
         except Exception as e:
-            logger.debug("discord_voice decrypt failed error=%s", e)
-            return None, None
+            logger.error("discord_voice decrypt failed error=%s", e)
+            raise
         if ext_data_len and len(decrypted) > ext_data_len:
             decrypted = decrypted[ext_data_len:]
         if has_padding and decrypted:
@@ -405,7 +412,7 @@ class DiscordVoiceConnection:
 
         while self._running and self._udp is not None:
             try:
-                data = await self._loop.sock_recv(self._udp, 4096)
+                data = await wait(self._loop.sock_recv(self._udp, 4096), IO_TIMEOUT_S, "discord voice udp recv")
                 if self._paused:
                     continue
                 ssrc, opus = self._decrypt(data)
@@ -487,11 +494,31 @@ class DiscordVoiceConnection:
 class DiscordVoiceService:
     def __init__(self, *, session=None):
         self._session = session
-        self._lock = asyncio.Lock()
+        self._lock = BoundedLock(where="discord voice")
         self._connections = {}
 
     def _key(self, *, acct_id, guild_id):
         return f"{acct_id}:{guild_id}"
+
+    async def inject_audio_pcm(self, *, acct_id, guild_id, pcm_s16le_mono_48k, channel_id=None):
+        acct_id = (acct_id or "").strip()
+        guild_id = (guild_id or "").strip()
+        channel_id = (channel_id or "").strip()
+        if not acct_id or not guild_id or not pcm_s16le_mono_48k:
+            return False
+        key = self._key(acct_id=acct_id, guild_id=guild_id)
+        async with self._lock:
+            conn = self._connections.get(key)
+        if conn is None:
+            return False
+        if channel_id and conn.channel_id and conn.channel_id != channel_id:
+            return False
+        if conn.on_audio_in is None:
+            return False
+        result = conn.on_audio_in(pcm_s16le_mono_48k)
+        if asyncio.iscoroutine(result):
+            await result
+        return True
 
     async def handle_credentials(
         self,
@@ -556,8 +583,9 @@ class DiscordVoiceService:
         content = ext_dict('discord voice content', content)
         try:
             guild_id = ext_str("guild_id", content.get("guild_id"), default="")
-        except ExternalError:
-            return False
+        except ExternalError as e:
+            logger.error("discord voice left invalid content error=%s", e)
+            raise
         if not guild_id:
             return False
         key = self._key(acct_id=acct_id, guild_id=guild_id)

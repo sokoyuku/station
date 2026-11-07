@@ -3,6 +3,7 @@ from dataclasses import dataclass, field
 
 from station import logger
 from station.prototypes.model_config import CONFIG_POLICY_HINT, SECRET_DELETE_HINT
+from station.timeouts import PROCESS_STOP_TIMEOUT_S, BoundedLock, wait
 
 
 @dataclass(slots=True)
@@ -11,13 +12,13 @@ class DeviceAuthState:
     poll_task: object = None
     reply_to: object = None
     extra: dict = field(default_factory=dict)
-    guard: asyncio.Lock = field(default_factory=asyncio.Lock)
+    guard: asyncio.Lock = field(default_factory=lambda: BoundedLock(where="device auth"))
 
 
 class PrototypeDeviceAuth:
     def _init_device_auth(self):
         self._auth_states = {}
-        self._auth_states_guard = asyncio.Lock()
+        self._auth_states_guard = BoundedLock(where="device auth states")
 
     async def _get_auth_state(self, acct_id):
         async with self._auth_states_guard:
@@ -32,9 +33,9 @@ class PrototypeDeviceAuth:
             return
         task.cancel()
         try:
-            await task
+            await wait(task, PROCESS_STOP_TIMEOUT_S, "device auth poll")
         except asyncio.CancelledError:
-            pass
+            logger.info("device auth poll cancelled")
 
     def _reset_auth_state(self, state):
         old_task = state.poll_task

@@ -7,7 +7,6 @@ STICKER_NATIVE_KINDS = NATIVE_KINDS + ("sticker",)
 _DEFAULT = {
     "reuse_file_id": False,
     "reuse_http_url": False,
-    "reuse_mxc": False,
     "download_http_url": False,
     "native_kinds": NATIVE_KINDS,
     "degrade": {"sticker": "photo"},
@@ -20,7 +19,6 @@ PLATFORMS = {
     "telegram": {
         "reuse_file_id": True,
         "reuse_http_url": False,
-        "reuse_mxc": False,
         "download_http_url": False,
         "native_kinds": STICKER_NATIVE_KINDS,
         "degrade": {},
@@ -31,19 +29,7 @@ PLATFORMS = {
     "discord": {
         "reuse_file_id": False,
         "reuse_http_url": False,
-        "reuse_mxc": False,
         "download_http_url": True,
-        "native_kinds": NATIVE_KINDS,
-        "degrade": {"sticker": "photo"},
-        "caption_with_media": True,
-        "media_chat_types": None,
-        "reply_to": True,
-    },
-    "matrix": {
-        "reuse_file_id": False,
-        "reuse_http_url": False,
-        "reuse_mxc": True,
-        "download_http_url": False,
         "native_kinds": NATIVE_KINDS,
         "degrade": {"sticker": "photo"},
         "caption_with_media": True,
@@ -53,7 +39,6 @@ PLATFORMS = {
     "qq": {
         "reuse_file_id": False,
         "reuse_http_url": False,
-        "reuse_mxc": False,
         "download_http_url": True,
         "native_kinds": NATIVE_KINDS,
         "degrade": {"sticker": "photo"},
@@ -64,7 +49,6 @@ PLATFORMS = {
     "whatsapp": {
         "reuse_file_id": False,
         "reuse_http_url": False,
-        "reuse_mxc": False,
         "download_http_url": False,
         "native_kinds": NATIVE_KINDS,
         "degrade": {"sticker": "photo"},
@@ -75,7 +59,6 @@ PLATFORMS = {
     "whatsapp_cloud": {
         "reuse_file_id": True,
         "reuse_http_url": True,
-        "reuse_mxc": False,
         "download_http_url": False,
         "native_kinds": STICKER_NATIVE_KINDS,
         "degrade": {"animation": "video"},
@@ -111,8 +94,6 @@ def media_ref_action(platform, ref):
     if not ref:
         return ""
     row = get(platform)
-    if ref.startswith("mxc://"):
-        return "reuse" if row.get("reuse_mxc") else "reject"
     if ref.startswith("http://") or ref.startswith("https://"):
         if row.get("reuse_http_url"):
             return "reuse"

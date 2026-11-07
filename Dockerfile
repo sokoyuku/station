@@ -6,10 +6,11 @@ WORKDIR /workspace
 RUN apt-get update \
     && apt-get install -y --no-install-recommends build-essential cargo gcc g++ libffi-dev libolm-dev libssl-dev pkg-config \
     && rm -rf /var/lib/apt/lists/*
-COPY pyproject.toml requirements.txt /workspace/station/
+COPY pyproject.toml requirements.in requirements.txt /workspace/station/
 COPY src /workspace/station/src
 COPY README.md /workspace/station/README.md
-RUN pip install --user /workspace/station
+RUN pip install --user -r /workspace/station/requirements.txt \
+    && pip install --user --no-deps /workspace/station
 
 FROM python:3.12-slim-bookworm
 ENV PYTHONDONTWRITEBYTECODE=1 \

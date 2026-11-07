@@ -7,6 +7,7 @@ from station import logger
 from station.api.http import log_caught
 from station.errors import ExternalError
 from station.prototypes.boundary import ext_dict, ext_mapping_get, ext_require, validate_inbound_data
+from station.timeouts import IDLE_WAIT_TIMEOUT_S, PROCESS_STOP_TIMEOUT_S, BoundedLock, wait
 
 @dataclass(slots=True)
 class InboundMessageContext:
@@ -53,7 +54,7 @@ class PrototypeInbound:
         server = self.app["config"].server
         self._inbound_workers = []
         self._started = False
-        self._start_lock = asyncio.Lock()
+        self._start_lock = BoundedLock(where="inbound start")
         self._start_task = None
         self._worker_count = server.inbound_workers
         self._queue_size = server.inbound_queue
@@ -185,6 +186,8 @@ class PrototypeInbound:
 
     async def _claim_batch(self):
         while True:
+            if not self._started:
+                return None
             if self._ready_chats:
                 key = self._ready_chats.popleft()
                 self._ready_set.discard(key)
@@ -205,7 +208,12 @@ class PrototypeInbound:
             self._sched_wakeup.clear()
             if self._ready_chats:
                 continue
-            await self._sched_wakeup.wait()
+            try:
+                await wait(self._sched_wakeup.wait(), IDLE_WAIT_TIMEOUT_S, "inbound scheduler")
+            except TimeoutError:
+                if not self._started:
+                    return None
+                continue
 
     async def _enqueue_inbound(self, kind, data, model_id, model_settings, *, chat_id=None, acct_id=None, request_id=None):
         job = self._job_from_parts(
@@ -293,6 +301,8 @@ class PrototypeInbound:
     async def _inbound_worker(self):
         while True:
             batch = await self._claim_batch()
+            if batch is None:
+                return
             inflight = []
             try:
                 for job in batch:
@@ -313,6 +323,16 @@ class PrototypeInbound:
             except ExternalError as e:
                 log_caught(logger, e, where="inbound_worker model_id=%s batch=%s" % (self.model_id, len(batch)))
                 for job in batch:
+                    chat_id = job.get("chat_id") or ""
+                    acct_id = job.get("acct_id") or ""
+                    try:
+                        await self.notify_chat_external(chat_id=chat_id, acct_id=acct_id, text=str(e))
+                    except Exception as notify_error:
+                        logger.error(
+                            "external notice failed model_id=%s error=%s",
+                            self.model_id,
+                            notify_error,
+                        )
                     job_id = job.get("job_id")
                     if job_id == "":
                         job_id = None
@@ -359,8 +379,8 @@ class PrototypeInbound:
     async def handle_command(self, data, model_id, model_settings, chat_id=None, acct_id=None, request_id=None):
         data = validate_inbound_data(data, label="command data")
         model_settings = ext_dict("model_settings", model_settings if model_settings is not None else {})
-        return await self._enqueue_inbound(
-            "command",
+        # Station commands always prevail: never wait behind model turns or the inbound queue.
+        await self._handle_command_impl(
             data,
             model_id,
             model_settings,
@@ -368,6 +388,8 @@ class PrototypeInbound:
             acct_id=acct_id,
             request_id=request_id,
         )
+        return True
+
 
     async def start(self):
         async with self._start_lock:
@@ -419,9 +441,11 @@ class PrototypeInbound:
         if task is not None and not task.done():
             task.cancel()
             try:
-                await task
-            except (asyncio.CancelledError, Exception):
-                pass
+                await wait(task, PROCESS_STOP_TIMEOUT_S, "inbound start task")
+            except asyncio.CancelledError:
+                logger.info("inbound start task cancelled model_id=%s", self.model_id)
+            except Exception as e:
+                logger.error("unexpected where=inbound start stop model_id=%s error=%s", self.model_id, e, exc_info=e)
         self._started = False
         workers = self._inbound_workers
         self._inbound_workers = []
@@ -430,7 +454,25 @@ class PrototypeInbound:
         for task in workers:
             task.cancel()
         if workers:
-            await asyncio.gather(*workers, return_exceptions=True)
+            try:
+                results = await wait(
+                    asyncio.gather(*workers, return_exceptions=True),
+                    PROCESS_STOP_TIMEOUT_S,
+                    "inbound workers",
+                )
+            except TimeoutError as e:
+                logger.error("inbound workers did not stop model_id=%s error=%s", self.model_id, e)
+                raise
+            for result in results:
+                if isinstance(result, asyncio.CancelledError):
+                    logger.info("inbound worker cancelled model_id=%s", self.model_id)
+                elif isinstance(result, BaseException):
+                    logger.error(
+                        "inbound worker stop failed model_id=%s error=%s",
+                        self.model_id,
+                        result,
+                        exc_info=result,
+                    )
         self._chat_queues = {}
         self._ready_chats = deque()
         self._ready_set = set()

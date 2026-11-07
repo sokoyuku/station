@@ -1,5 +1,6 @@
 import json
 
+from station.conductor.platforms.guidance import utf16_len
 from station.errors import ExternalError
 from station.prototypes.boundary import ext_dict
 
@@ -139,7 +140,7 @@ def discord_components(keyboard):
         for btn in row:
             if len(comps) >= DISCORD_BUTTONS_PER_ROW:
                 break
-            label = _truncate_runes(btn.get("text") or "", DISCORD_LABEL_MAX)
+            label = _truncate_utf16(btn.get("text") or "", DISCORD_LABEL_MAX)
             if not label:
                 continue
             item = {"type": 2, "label": label}
@@ -337,14 +338,32 @@ def _first_str(obj, *keys):
 
 
 def _truncate_runes(text, limit):
+    return _truncate_units(text, limit, len)
+
+
+def _truncate_utf16(text, limit):
+    # Discord component labels are UTF-16 code units, matching the Hermes adapter.
+    return _truncate_units(text, limit, utf16_len)
+
+
+def _truncate_units(text, limit, len_fn):
     text = str(text or "")
     if limit <= 0:
         return ""
-    if len(text) <= limit:
+    if len_fn(text) <= limit:
         return text
     if limit == 1:
         return "…"
-    return text[: limit - 1] + "…"
+    ellipsis = "…"
+    keep = limit - len_fn(ellipsis)
+    lo, hi = 0, len(text)
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if len_fn(text[:mid]) <= keep:
+            lo = mid
+        else:
+            hi = mid - 1
+    return text[:lo] + ellipsis
 
 
 def _truncate_bytes(text, limit):

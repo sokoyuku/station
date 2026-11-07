@@ -7,6 +7,7 @@ from station.prototypes.launch_settings import child_process_env
 from station.prototypes.fs_paths import sanitize_path_component
 from station.prototypes.gateway_process import gateway_subprocess_kwargs
 from station.prototypes.jsonrpc_process import JsonLineRpcProcess
+from station.timeouts import BoundedLock
 
 class PiRpcProcess(JsonLineRpcProcess):
     def __init__(self, *, settings, acct_id, chat_id):
@@ -144,7 +145,7 @@ class PiGatewayProcess:
         self.settings = settings
         self.proc = None
         self._chats = {}
-        self._lock = asyncio.Lock()
+        self._lock = BoundedLock(where="pi gateway")
 
     async def start(self):
         Path(self.settings.workspace_dir).expanduser().mkdir(parents=True, exist_ok=True)
@@ -177,13 +178,22 @@ class PiGatewayProcess:
     def get_chat(self, *, acct_id, chat_id):
         return self._chats.get("%s:%s" % (acct_id, chat_id))
 
-    async def drop_chat(self, *, acct_id, chat_id):
+    async def _pop_chat(self, *, acct_id, chat_id):
         key = "%s:%s" % (acct_id, chat_id)
         async with self._lock:
             process = self._chats.pop(key, None)
             if process is not None and self.proc is process.proc:
                 leftover = next(iter(self._chats.values()), None)
                 self.proc = leftover.proc if leftover is not None else None
+        return process
+
+    async def kill_chat(self, *, acct_id, chat_id):
+        process = await self._pop_chat(acct_id=acct_id, chat_id=chat_id)
+        if process is not None:
+            await process.close()
+
+    async def drop_chat(self, *, acct_id, chat_id):
+        process = await self._pop_chat(acct_id=acct_id, chat_id=chat_id)
         session_dir = (
             process.session_dir
             if process is not None

@@ -140,8 +140,9 @@ class PrototypeWebRTC:
             webrtc_type = ext_str("webrtc type", webrtc_type)
         platform = ext_str("platform", data.get("platform"))
         chat_type = ext_str("chat_type", data.get("chat_type"))
-        if not await self._call_support_enabled():
-            if webrtc_type == "m.call.invite" and chat_id:
+        state = await self._call_support_state()
+        if state is not True:
+            if state is False and webrtc_type == "m.call.invite" and chat_id:
                 await self.send_outbound(
                     text="This model does not support voice calls. Continuing as a text channel.",
                     chat_id=chat_id,
@@ -198,14 +199,14 @@ class PrototypeWebRTC:
             return True
         return False
 
-    async def _call_support_enabled(self):
+    async def _call_support_state(self):
         ctx = self.client_context
         if not ctx or not ctx.db or ctx.prototype_id is None:
-            return False
+            return None
         info = await ctx.db.get_prototype_info(ctx.prototype_id)
-        if not info:
-            return False
-        call_support = info.get("call_support")
-        if call_support is None:
-            return False
-        return ext_bool("call_support", call_support)
+        if not info or "call_support" not in info:
+            return None
+        return ext_bool("call_support", info.get("call_support"))
+
+    async def _call_support_enabled(self):
+        return await self._call_support_state() is True

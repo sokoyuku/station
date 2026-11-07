@@ -34,10 +34,13 @@ def save_workspace_override(storage_dir, name, workspace):
 
 
 def clear_workspace_override(storage_dir, name):
+    path = workspace_override_path(storage_dir, name)
+    if not os.path.lexists(path):
+        return
     try:
-        os.remove(workspace_override_path(storage_dir, name))
-    except FileNotFoundError:
-        pass
+        os.remove(path)
+    except FileNotFoundError as exc:
+        logger.info("workspace override already absent path=%s error=%s", path, exc)
 
 
 class PrototypeWorkspace:

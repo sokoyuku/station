@@ -5,6 +5,7 @@ from typing import Iterable
 
 import aiohttp
 from station import logger
+from station.timeouts import wait
 from station.conductor.util import ext_str
 from station.prototypes.boundary import ext_dict, ext_list
 
@@ -43,17 +44,20 @@ def _resolve_system_dns() -> set[str]:
     try:
         results = socket.getaddrinfo(_TELEGRAM_API_HOST, 443, socket.AF_INET)
         return {addr[4][0] for addr in results}
-    except OSError:
-        return set()
+    except OSError as exc:
+        logger.error("telegram system dns failed error=%s", exc)
+        raise
 
 async def _query_doh_provider(session: aiohttp.ClientSession, provider: dict) -> list[str]:
     try:
         async with session.get(provider["url"], params=provider["params"], headers=provider["headers"]) as resp:
             if resp.status != 200:
-                return []
+                raw = await resp.text()
+                raise RuntimeError("doh status=%s body=%s" % (resp.status, raw[:300]))
             data = await resp.json(content_type=None)
-    except (aiohttp.ClientError, asyncio.TimeoutError, OSError):
-        return []
+    except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
+        logger.error("telegram doh query failed url=%s error=%s", provider["url"], exc)
+        raise
     data = ext_dict('doh response', data)
     answers = data.get("Answer")
     if answers is None:
@@ -77,12 +81,19 @@ async def discover_fallback_ips() -> list[str]:
     timeout = aiohttp.ClientTimeout(total=_DOH_TIMEOUT)
     async with aiohttp.ClientSession(timeout=timeout) as session:
         doh_tasks = [_query_doh_provider(session, p) for p in _DOH_PROVIDERS]
-        system_dns_task = asyncio.to_thread(_resolve_system_dns)
-        results = await asyncio.gather(system_dns_task, *doh_tasks, return_exceptions=True)
+        async def _system_dns():
+            return await wait(asyncio.to_thread(_resolve_system_dns), _DOH_TIMEOUT, "telegram system dns")
+
+        results = await asyncio.gather(_system_dns(), *doh_tasks, return_exceptions=True)
 
     doh_ips: list[str] = []
-    for r in results[1:]:
+    for r in results:
+        if isinstance(r, BaseException):
+            logger.error("telegram dns discovery failed error=%s", r, exc_info=r)
+            continue
         if isinstance(r, list):
+            doh_ips.extend(r)
+        elif isinstance(r, set):
             doh_ips.extend(r)
 
     seen: set[str] = set()
@@ -109,7 +120,8 @@ class TelegramFallbackResolver(aiohttp.abc.AbstractResolver):
 
         try:
             results = await self._primary.resolve(host, port, family)
-        except OSError:
+        except OSError as exc:
+            logger.error("telegram resolver failed host=%s error=%s", host, exc)
             results = []
 
         primary_hosts = []

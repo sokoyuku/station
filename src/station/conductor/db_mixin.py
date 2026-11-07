@@ -1,7 +1,7 @@
 import json
 import sqlite3
-import time
 
+from station import instant
 from station.errors import ExternalError, InternalError
 from station.conductor.platform_types import strip_qr_prefix, validate_local_platform_type
 from station.database.request_dedupe import run_in_db_executor
@@ -20,7 +20,7 @@ class LocalConductorDatabaseMixin:
                 server TEXT,
                 encrypted_token TEXT,
                 is_local INTEGER,
-                created_at INTEGER
+                created_at TEXT
             )
             """
         )
@@ -35,7 +35,7 @@ class LocalConductorDatabaseMixin:
                 prototype_id INTEGER,
                 chat_type TEXT,
                 carrier_user_id TEXT,
-                created_at INTEGER,
+                created_at TEXT,
                 PRIMARY KEY (acct_id, chat_id)
             )
             """
@@ -48,7 +48,7 @@ class LocalConductorDatabaseMixin:
                 acct_type TEXT,
                 state_key TEXT,
                 state_json TEXT,
-                updated_at INTEGER,
+                updated_at TEXT,
                 PRIMARY KEY (acct_id, acct_type, state_key)
             )
             """
@@ -139,7 +139,7 @@ class LocalConductorDatabaseMixin:
                         server,
                         encrypted_token,
                         1 if is_local else 0,
-                        int(time.time()),
+                        instant.format(instant.now()),
                     ),
                 )
 
@@ -197,6 +197,16 @@ class LocalConductorDatabaseMixin:
 
         return await run_in_db_executor(_sync)
 
+    async def update_local_account_secret(self, acct_id: str, *, encrypted_token: str, server: str) -> None:
+        def _sync():
+            with self._connect() as conn:
+                conn.execute(
+                    "UPDATE local_accounts SET encrypted_token = ?, server = ? WHERE acct_id = ?",
+                    (encrypted_token, server, acct_id),
+                )
+
+        await run_in_db_executor(_sync)
+
     async def delete_local_account(self, acct_id: str) -> None:
         if not acct_id:
             return
@@ -235,7 +245,7 @@ class LocalConductorDatabaseMixin:
         def _sync():
             with self._connect() as conn:
                 conn.execute("DELETE FROM local_chats WHERE model_id = ?", (model_id,))
-                now = int(time.time())
+                now = instant.format(instant.now())
                 for acct_id, chat_id, mid, pid, chat_type, carrier in prepared:
                     conn.execute(
                         """
@@ -280,7 +290,7 @@ class LocalConductorDatabaseMixin:
                         prototype_id,
                         chat_type,
                         carrier_user_id,
-                        int(time.time()),
+                        instant.format(instant.now()),
                     ),
                 )
 
@@ -394,7 +404,7 @@ class LocalConductorDatabaseMixin:
                     (acct_id, acct_type, state_key, state_json, updated_at)
                     VALUES (?, ?, ?, ?, ?)
                     """,
-                    (acct_id, acct_type, state_key, payload, int(time.time())),
+                    (acct_id, acct_type, state_key, payload, instant.format(instant.now())),
                 )
 
         await run_in_db_executor(_sync)
