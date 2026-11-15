@@ -62,7 +62,7 @@ _WA_BOLD_UNDER_RE = re.compile(r"__(.+?)__")
 _WA_STRIKE_RE = re.compile(r"~~(.+?)~~")
 _WA_HEADER_RE = re.compile(r"(?m)^#{1,6}\s+(.+)$")
 _WA_LINK_RE = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
-_WA_SINGLE_STAR_RE = re.compile(r"\*([^*\n]+)\*")
+_WA_SINGLE_STAR_RE = re.compile(r"(?<!\*)\*(?!\s|\*)([^*\n]*?\S[^*\n]*?)\*(?!\*)")
 
 _TELEGRAM_CHUNK_INDEX_RE = re.compile(r" \((\d+)/(\d+)\)$")
 
@@ -319,8 +319,18 @@ def _render_table_block(table_block: list[str]) -> str:
 def convert_tables_to_bullets(content: str) -> str:
     lines = content.split("\n")
     out: list[str] = []
+    in_fence = False
     i = 0
     while i < len(lines):
+        if lines[i].count("```") % 2 == 1:
+            in_fence = not in_fence
+            out.append(lines[i])
+            i += 1
+            continue
+        if in_fence:
+            out.append(lines[i])
+            i += 1
+            continue
         if (
             i + 2 < len(lines)
             and _looks_like_table_row(lines[i])
@@ -468,12 +478,21 @@ def qq_markdown_enabled() -> bool:
     v = (os.environ.get("QQ_MARKDOWN_SUPPORT") or "").strip()
     return v == "" or (v != "0" and v.lower() != "false")
 
+def _strip_fence_markers(match: re.Match) -> str:
+    body = match.group(0)[3:-3]
+    if "\n" in body:
+        first, rest = body.split("\n", 1)
+        if first.strip() and " " not in first.strip():
+            return rest.lstrip("\n")
+    return body.strip("\n")
+
+
 def strip_markdown(text: str) -> str:
     text = _QQ_BOLD_RE.sub(r"\1", text)
     text = _QQ_ITALIC_STAR_RE.sub(r"\1", text)
     text = _QQ_BOLD_UNDER_RE.sub(r"\1", text)
     text = _QQ_ITALIC_UNDER_RE.sub(r"\1", text)
-    text = _QQ_CODE_BLOCK_RE.sub("", text)
+    text = _QQ_CODE_BLOCK_RE.sub(_strip_fence_markers, text)
     text = _QQ_INLINE_CODE_RE.sub(r"\1", text)
     text = _QQ_HEADING_RE.sub("", text)
     text = _QQ_LINK_RE.sub(r"\1", text)
@@ -495,6 +514,8 @@ def format_outbound_text(platform: str, text: str) -> str:
             return text
         return strip_markdown_v2(text)
     if kind != KIND_MARKDOWN:
+        if p in ("whatsapp", "whatsapp_cloud"):
+            return format_whatsapp_message(text)
         return text
     if p == "telegram":
         return format_telegram_markdown_v2(text)
@@ -528,21 +549,6 @@ def prepare_outbound_text(platform: str, text: str) -> list[str]:
     len_fn = utf16_len if uses_utf16_length(platform) else None
     chunks = truncate_message(formatted, max_len, len_fn)
     p = (platform or "").strip().lower()
-    if p == "discord" and len(chunks) > MAX_DISCORD_SPLIT_MESSAGES:
-        note = "\n…(truncated)"
-        kept = list(chunks[: MAX_DISCORD_SPLIT_MESSAGES - 1])
-        last = chunks[MAX_DISCORD_SPLIT_MESSAGES - 1]
-        if len_fn is None:
-            if len(last) + len(note) <= max_len:
-                last = last + note
-            else:
-                last = truncate_to_limit(last, max(1, max_len - len(note)), None) + note
-        else:
-            if len_fn(last) + len_fn(note) <= max_len:
-                last = last + note
-            else:
-                last = truncate_to_limit(last, max(1, max_len - len_fn(note)), len_fn) + note
-        chunks = kept + [last]
     if p == "telegram" and kind != KIND_TEXT:
         chunks = [separate_chunk_indicator_from_fence(c) for c in chunks]
         if len(chunks) > 1:
@@ -712,7 +718,7 @@ MAX_WHATSAPP_VIDEO_BYTES = 16 * 1024 * 1024
 MAX_WHATSAPP_AUDIO_BYTES = 16 * 1024 * 1024
 MAX_WHATSAPP_DOCUMENT_BYTES = 100 * 1024 * 1024
 MAX_WHATSAPP_STICKER_BYTES = 100 * 1024
-MAX_QQ_MEDIA_BYTES = 100 * 1024 * 1024
+MAX_QQ_MEDIA_BYTES = 200 * 1000 * 1000
 
 _METHOD_MEDIA_KIND = {
     "send_photo": "image",

@@ -1,16 +1,20 @@
 #!/usr/bin/env node
 import http from "http";
+import { execFileSync } from "child_process";
 import {
   makeWASocket,
   useMultiFileAuthState,
   DisconnectReason,
-  downloadMediaMessage,
+  downloadEncryptedContent,
+  getMediaKeys,
 } from "@whiskeysockets/baileys";
 import { Boom } from "@hapi/boom";
 import pino from "pino";
 import path from "path";
-import { mkdirSync } from "fs";
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync, rmSync } from "fs";
+import { tmpdir } from "os";
 import { resolveWhatsAppVersion } from "./version.js";
+import { baileysSocketConfig, mediaRequestDispatcher, WHATSAPP_DEVICE } from "./wab-socket.js";
 
 const args = process.argv.slice(2);
 function getArg(name, defaultVal) {
@@ -25,8 +29,20 @@ mkdirSync(SESSION_DIR, { recursive: true });
 const logger = pino({ level: "silent" });
 const inbox = [];
 const mediaStore = new Map();
+const messageStore = new Map();
+const MESSAGE_STORE_MAX = 512;
 let ready = false;
 let sock = null;
+
+function rememberMessage(msg) {
+  const id = String(msg?.key?.id || "").trim();
+  if (!id || !msg?.key || !msg?.message) return;
+  messageStore.set(id, msg);
+  while (messageStore.size > MESSAGE_STORE_MAX) {
+    const oldest = messageStore.keys().next().value;
+    messageStore.delete(oldest);
+  }
+}
 
 function jidFromChatId(chatId) {
   const raw = String(chatId || "").trim();
@@ -35,10 +51,12 @@ function jidFromChatId(chatId) {
   return `${raw}@s.whatsapp.net`;
 }
 
-function quotedFromReply(jid, replyTo) {
+function quotedFromReply(replyTo) {
   const id = String(replyTo || "").trim();
   if (!id) return undefined;
-  return { key: { remoteJid: jid, id } };
+  const stored = messageStore.get(id);
+  if (stored?.key && stored?.message) return stored;
+  return undefined;
 }
 
 function mediaKindFromMessage(message) {
@@ -53,10 +71,11 @@ function mediaKindFromMessage(message) {
     };
   }
   if (message.videoMessage) {
+    const gif = Boolean(message.videoMessage.gifPlayback);
     return {
-      kind: "video",
+      kind: gif ? "animation" : "video",
       inner: message.videoMessage,
-      filename: message.videoMessage.fileName || "video.mp4",
+      filename: message.videoMessage.fileName || (gif ? "animation.mp4" : "video.mp4"),
       mime: message.videoMessage.mimetype || "video/mp4",
       caption: message.videoMessage.caption || "",
     };
@@ -118,7 +137,7 @@ function replyToFromMessage(message) {
 
 function normalizeWhatsAppId(value) {
   if (!value) return "";
-  return String(value).replace(":", "@");
+  return String(value).replace(/:\d+(?=@)/, "").replace(/:\d+$/, "");
 }
 
 function whatsappIdKeys(value) {
@@ -135,11 +154,16 @@ function whatsappIdsOverlap(left, right) {
 }
 
 function messageContent(message) {
-  const content = message || {};
-  if (content.ephemeralMessage?.message) return content.ephemeralMessage.message;
-  if (content.viewOnceMessage?.message) return content.viewOnceMessage.message;
-  if (content.viewOnceMessageV2?.message) return content.viewOnceMessageV2.message;
-  if (content.documentWithCaptionMessage?.message) return content.documentWithCaptionMessage.message;
+  let content = message || {};
+  for (let depth = 0; depth < 8; depth += 1) {
+    const inner =
+      content.ephemeralMessage?.message ||
+      content.viewOnceMessage?.message ||
+      content.viewOnceMessageV2?.message ||
+      content.documentWithCaptionMessage?.message;
+    if (!inner) break;
+    content = inner;
+  }
   return content;
 }
 
@@ -157,10 +181,17 @@ function contextInfoFromMessage(message) {
 function inboundChatId(remote) {
   const raw = String(remote || "").trim();
   const lower = raw.toLowerCase();
-  if (lower.endsWith("@g.us") || lower.endsWith("@broadcast") || lower.endsWith("@newsletter")) {
+  if (!raw) return "";
+  if (lower.endsWith("@s.whatsapp.net")) return raw.split("@")[0];
+  if (
+    lower.endsWith("@g.us")
+    || lower.endsWith("@broadcast")
+    || lower.endsWith("@newsletter")
+    || lower.endsWith("@lid")
+  ) {
     return raw;
   }
-  return raw.split("@")[0];
+  return raw;
 }
 
 function inboundChatType(remote) {
@@ -176,10 +207,36 @@ function isBroadcastChat(remote) {
   return cid === "status@broadcast" || cid.endsWith("@broadcast") || cid.endsWith("@newsletter");
 }
 
+function mediaDecryptType(kind) {
+  if (kind === "photo" || kind === "image") return "image";
+  if (kind === "animation" || kind === "video") return "video";
+  if (kind === "voice") return "ptt";
+  if (kind === "audio") return "audio";
+  if (kind === "sticker") return "sticker";
+  return "document";
+}
+
+async function downloadPeerMedia(sock, media) {
+  const conn = await sock.refreshMediaConn(false);
+  const host = String(conn?.hosts?.[0]?.hostname || "").trim();
+  const directPath = String(media?.inner?.directPath || "").trim();
+  if (!host || !directPath) {
+    throw new Error("media host missing");
+  }
+  const path = directPath.startsWith("/") ? directPath : `/${directPath}`;
+  const url = `https://${host}${path}`;
+  const keys = await getMediaKeys(media.inner.mediaKey, mediaDecryptType(media.kind));
+  const stream = await downloadEncryptedContent(url, keys, {
+    options: { dispatcher: mediaRequestDispatcher() },
+  });
+  const chunks = [];
+  for await (const chunk of stream) chunks.push(chunk);
+  return Buffer.concat(chunks);
+}
+
 function mentionsBot({ text, mentionedIds, quotedParticipant, botIds, broadcast }) {
   if (broadcast) return false;
   const body = String(text || "");
-  if (/(^|\s)@all\b/i.test(body)) return true;
   for (const botId of botIds || []) {
     for (const mentioned of mentionedIds || []) {
       if (whatsappIdsOverlap(botId, mentioned)) return true;
@@ -194,16 +251,16 @@ function mentionsBot({ text, mentionedIds, quotedParticipant, botIds, broadcast 
 async function connect() {
   const { state, saveCreds } = await useMultiFileAuthState(SESSION_DIR);
   const version = await resolveWhatsAppVersion();
-  sock = makeWASocket({
+  sock = makeWASocket(await baileysSocketConfig({
     version,
     auth: state,
     logger,
     printQRInTerminal: false,
-    browser: ["Sokoyuku Local", "Chrome", "120.0"],
+    browser: WHATSAPP_DEVICE,
     syncFullHistory: false,
     markOnlineOnConnect: false,
     getMessage: async () => ({ conversation: "" }),
-  });
+  }));
   sock.ev.on("creds.update", saveCreds);
   sock.ev.on("connection.update", (update) => {
     const { connection, lastDisconnect } = update || {};
@@ -221,24 +278,30 @@ async function connect() {
     }
   });
   sock.ev.on("messages.upsert", async (payload) => {
+    const upsertType = payload?.type;
+    if (upsertType !== "notify" && upsertType !== "append") return;
     const messages = payload?.messages || [];
     for (const msg of messages) {
       if (!msg || msg.key?.fromMe) continue;
-      const text = textFromMessage(msg.message);
-      const media = mediaKindFromMessage(msg.message);
+      rememberMessage(msg);
+      const content = messageContent(msg.message);
+      const text = textFromMessage(content);
+      const media = mediaKindFromMessage(content);
       if (!String(text || "").trim() && !media) continue;
       const remote = String(msg.key?.remoteJid || "");
+      if (isBroadcastChat(remote)) continue;
       const participant = String(msg.key?.participant || msg.key?.remoteJid || "");
       const messageId = String(msg.key?.id || "");
       let mediaId = "";
       if (media && sock) {
         try {
-          const buf = await downloadMediaMessage(msg, "buffer", {}, { logger, reuploadRequest: sock.updateMediaMessage });
+          const buf = await downloadPeerMedia(sock, media);
           if (buf && buf.length) {
             mediaId = messageId || `${Date.now()}`;
             mediaStore.set(mediaId, { bytes: buf, filename: media.filename, mime: media.mime, kind: media.kind });
           }
         } catch (e) {
+          process.stderr.write("whatsapp media download failed " + String(e?.message || e) + "\n");
           mediaId = "";
         }
       }
@@ -250,7 +313,11 @@ async function connect() {
       const botIds = Array.from(
         new Set([normalizeWhatsAppId(sock?.user?.id), normalizeWhatsAppId(sock?.user?.lid)].filter(Boolean))
       );
-      const bodyText = String(text || media?.caption || "");
+      let bodyText = String(text || media?.caption || "");
+      if (media && !mediaId) {
+        const note = `[${media.kind || "media"} could not be downloaded]`;
+        bodyText = bodyText ? `${bodyText}\n${note}` : note;
+      }
       const broadcast = isBroadcastChat(remote);
       inbox.push({
         chat_id: inboundChatId(remote),
@@ -293,6 +360,53 @@ function readBody(req) {
   });
 }
 
+function withTempDir(fn) {
+  const dir = mkdtempSync(path.join(tmpdir(), "wa-media-"));
+  try {
+    return fn(dir);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+function convertVoiceToOpus(buf) {
+  try {
+    return withTempDir((dir) => {
+      const src = path.join(dir, "audio.bin");
+      const dest = path.join(dir, "voice.ogg");
+      writeFileSync(src, buf);
+      execFileSync(
+        "ffmpeg",
+        ["-y", "-i", src, "-ar", "48000", "-ac", "1", "-c:a", "libopus", "-b:a", "32k", "-f", "ogg", dest],
+        { timeout: 30000, stdio: "pipe" },
+      );
+      const out = readFileSync(dest);
+      if (!out.subarray(0, 4).equals(Buffer.from("OggS"))) return null;
+      return { buf: out, mime: "audio/ogg; codecs=opus", ptt: true };
+    });
+  } catch {
+    return null;
+  }
+}
+
+function convertGifToMp4(buf) {
+  try {
+    return withTempDir((dir) => {
+      const src = path.join(dir, "animation.gif");
+      const dest = path.join(dir, "animation.mp4");
+      writeFileSync(src, buf);
+      execFileSync(
+        "ffmpeg",
+        ["-y", "-i", src, "-movflags", "faststart", "-pix_fmt", "yuv420p", "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2", dest],
+        { timeout: 30000, stdio: "pipe" },
+      );
+      return readFileSync(dest);
+    });
+  } catch {
+    return null;
+  }
+}
+
 function sendPayload(kind, buf, filename, mime, caption) {
   const type = String(kind || "").trim();
   if (type === "photo" || type === "image") {
@@ -302,13 +416,26 @@ function sendPayload(kind, buf, filename, mime, caption) {
     return { video: buf, caption: caption || undefined, mimetype: mime || "video/mp4" };
   }
   if (type === "voice") {
-    return { audio: buf, ptt: true, mimetype: mime || "audio/ogg; codecs=opus" };
+    const voice = convertVoiceToOpus(buf);
+    if (voice) {
+      return { audio: voice.buf, ptt: true, mimetype: voice.mime };
+    }
+    return {
+      document: buf,
+      fileName: filename || "audio",
+      mimetype: mime || "application/octet-stream",
+      caption: caption || undefined,
+    };
   }
   if (type === "audio") {
     return { audio: buf, ptt: false, mimetype: mime || "audio/mpeg" };
   }
   if (type === "animation") {
-    return { video: buf, gifPlayback: true, caption: caption || undefined, mimetype: mime || "video/mp4" };
+    const mp4 = convertGifToMp4(buf);
+    if (mp4) {
+      return { video: mp4, gifPlayback: true, caption: caption || undefined, mimetype: "video/mp4" };
+    }
+    return { image: buf, caption: caption || undefined, mimetype: mime || "image/gif" };
   }
   return {
     document: buf,
@@ -361,7 +488,8 @@ const server = http.createServer(async (req, res) => {
         res.end(JSON.stringify({ ok: false, error: "chat_id and text required" }));
         return;
       }
-      await sock.sendMessage(jid, { text }, { quoted: quotedFromReply(jid, body.reply_to) });
+      const sent = await sock.sendMessage(jid, { text }, { quoted: quotedFromReply(body.reply_to) });
+      rememberMessage(sent);
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ ok: true }));
       return;
@@ -382,7 +510,8 @@ const server = http.createServer(async (req, res) => {
       }
       const buf = Buffer.from(data, "base64");
       const payload = sendPayload(body.type, buf, body.filename, body.mime, body.caption);
-      await sock.sendMessage(jid, payload, { quoted: quotedFromReply(jid, body.reply_to) });
+      const sent = await sock.sendMessage(jid, payload, { quoted: quotedFromReply(body.reply_to) });
+      rememberMessage(sent);
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ ok: true }));
       return;

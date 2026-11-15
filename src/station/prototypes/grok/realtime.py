@@ -6,6 +6,7 @@ import json
 import aiohttp
 
 from station import logger
+from station.client.retry import client_connector, client_session
 from station.prototypes.grok.tools import VOICE_SERVER_TOOLS, live_function_tools
 from station.timeouts import IO_TIMEOUT_S, PROCESS_STOP_TIMEOUT_S, BoundedLock, wait, ws_timeout
 
@@ -66,10 +67,11 @@ class GrokRealtimeSession:
     async def start(self):
         if not self._token:
             raise RuntimeError("missing access token for Grok realtime")
-        self._session = aiohttp.ClientSession(
+        self._session = client_session(
             timeout=ws_timeout(),
             trust_env=True,
-            connector=aiohttp.TCPConnector(ssl=True, force_close=True, limit=4),
+            request_retry=False,
+            connector=client_connector(ssl=True, force_close=True, limit=4),
         )
         headers = {"Authorization": "Bearer %s" % self._token}
         self._ws = await self._session.ws_connect(

@@ -3,6 +3,7 @@
 aiohttp[speedups]>=3.10,<4
 uvloop>=0.21,<1
 aiortc>=1.9,<2
+numpy>=2,<3
 cryptography>=43,<50
 asyncpg>=0.29,<1
 discord.py>=2.4,<3

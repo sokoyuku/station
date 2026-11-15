@@ -11,8 +11,10 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 
 from station.api.http import ext_path_int, read_json_object
 from station.client.consul import CONSUL_TIMEOUT, fetch_prototype
+from station.client.retry import RetryableError, is_retryable_error, is_transient_status, retry_transient
 from station.database.consul_state import apply_consul_model, apply_consul_prototype
 from station.api.reception import is_slash_command
+from station.conductor.account_status import AccountUnreachable, check_local_account
 from station.conductor.crypto import default_private_key_path, decrypt_if_encrypted, load_private_key, public_key_token, write_private_key
 from station.conductor.platform_types import (
     is_qr_account_type,
@@ -362,18 +364,16 @@ class LocalConductor:
             headers["X-Conductor-Token"] = self.public_key_token
         if prototype_token:
             headers["X-Prototype-Token"] = prototype_token
-        try:
+        async def _once():
             async with self.session.request(method, url, json=payload, headers=headers, timeout=CONSUL_TIMEOUT) as resp:
                 try:
                     body = await resp.json(content_type=None)
                 except (aiohttp.ContentTypeError, json.JSONDecodeError, ValueError) as e:
-                    logger.error("consul request invalid json path=%s status=%s error=%s", path, resp.status, e)
-                    raise ExternalError(
-                        "consul request invalid json path=%s status=%s" % (path, resp.status),
-                        status=502,
-                        reason="consul_body",
-                        retryable=True,
+                    raise RetryableError(
+                        "consul invalid json path=%s status=%s error=%s" % (path, resp.status, e)
                     ) from e
+                if is_transient_status(resp.status):
+                    raise RetryableError("consul status=%s path=%s" % (resp.status, path))
                 if resp.status != 200:
                     logger.error("consul request failed path=%s status=%s body=%s", path, resp.status, body)
                     status = 404 if resp.status == 404 else (401 if resp.status == 401 else 502)
@@ -382,19 +382,24 @@ class LocalConductor:
                         "consul request failed path=%s status=%s" % (path, resp.status),
                         status=status,
                         reason=reason,
-                        retryable=resp.status >= 500 or resp.status == 429,
+                        retryable=False,
                     )
+                return ext_dict("consul body", body)
+
+        try:
+            return await retry_transient(_once, circuit_name="consul")
         except ExternalError:
             raise
-        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-            logger.error("consul request failed path=%s error=%s", path, e)
+        except Exception as e:
+            if not is_retryable_error(e):
+                raise
+            logger.error("consul request retry exhausted path=%s error=%s", path, e)
             raise ExternalError(
                 "consul request failed path=%s error=%s" % (path, e),
                 status=502,
                 reason="consul_request",
                 retryable=True,
             ) from e
-        return ext_dict("consul body", body)
 
     async def _consul_post_body(self, *, path: str, payload: dict, prototype_token: str | None = None) -> dict:
         return await self._consul_request(method="POST", path=path, payload=payload, prototype_token=prototype_token)
@@ -1797,6 +1802,69 @@ class LocalConductor:
         )
         return resp.status < 400
 
+    async def _resume_local_account(self, acct_id: str, acct_type: str) -> None:
+        adapter = self.get_platform(acct_type)
+        if adapter is None:
+            return
+        stored = await self.db.get_local_account(acct_id)
+        if stored is None:
+            compact = acct_id.replace("-", "")
+            if compact != acct_id:
+                stored = await self.db.get_local_account(compact)
+                if stored is not None:
+                    acct_id = compact
+        if stored is None:
+            return
+        model_id = stored.get("model_id")
+        if model_id is None:
+            model_id = ""
+        model_id = str(model_id).strip()
+        if not model_id or not await self.db.get_model(model_id):
+            return
+        await adapter.ensure_account_ready(acct_id)
+        task = self._poller_tasks.get(acct_id)
+        if task is not None and not task.done():
+            return
+        if task is not None:
+            self._poller_tasks.pop(acct_id, None)
+            self._poller_task_types.pop(acct_id, None)
+        self._poller_tasks[acct_id] = asyncio.create_task(
+            self._start_platform_poller(acct_id=acct_id, adapter=adapter)
+        )
+        self._poller_task_types[acct_id] = adapter.acct_type
+
+    async def handle_account_check_status(self, request: web.Request) -> web.Response:
+        unauthorized = self.require_consul_token(request)
+        if unauthorized is not None:
+            return unauthorized
+        body = await read_json_object(request)
+        acct_id = ext_str(body.get("acct_id"), "acct_id").strip()
+        acct_type = ext_str(body.get("acct_type"), "acct_type").strip().lower()
+        username = ext_str(body.get("acct_username"), "acct_username").strip()
+        token_raw = ext_str(body.get("acct_token"), "acct_token").strip()
+        server_raw = ext_str(body.get("server"), "server").strip()
+        if not acct_id or not acct_type:
+            return err("acct_id and acct_type are required", status=400)
+        try:
+            token, _ = decrypt_if_encrypted(self.private_key, token_raw)
+            server, _ = decrypt_if_encrypted(self.private_key, server_raw)
+        except (ExternalError, ValueError, json.JSONDecodeError, TypeError):
+            return err("Local account token could not be decrypted", status=400)
+        try:
+            status = await check_local_account(
+                self,
+                acct_id=acct_id,
+                acct_type=acct_type,
+                username=username,
+                token=token,
+                server=server,
+            )
+        except AccountUnreachable:
+            return web.json_response({"ok": False, "msg": "Could not reach the platform"})
+        if status == "active":
+            await self._resume_local_account(acct_id, acct_type)
+        return ok({"status": status})
+
     def decrypt_settings(self, settings):
         return self._decrypt_model_settings(settings)
 
@@ -1818,6 +1886,7 @@ def setup_local_conductor_routes(app: web.Application) -> None:
     app.router.add_post("/pair/start", catch_external(lc.handle_pair_start))
     app.router.add_post("/pair/status", catch_external(lc.handle_pair_status))
     app.router.add_post("/pair/cancel", catch_external(lc.handle_pair_cancel))
+    app.router.add_post("/account/check_status", catch_external(lc.handle_account_check_status))
     for adapter in lc.platforms.values():
         adapter.register_routes(app)
     app.router.add_post("/user/sync", catch_external(lc.handle_user_sync))

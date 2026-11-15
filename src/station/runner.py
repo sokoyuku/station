@@ -11,6 +11,7 @@ from pathlib import Path
 
 from .station import Station
 from station import logger
+from station.client.retry import client_session
 from station.errors import ExternalError
 from station.timeouts import http_timeout
 from station.prototypes.boundary import ext_bool, ext_dict, ext_float, ext_int, ext_list, ext_str
@@ -202,7 +203,7 @@ async def _post_station_admin(
     headers: dict,
 ) -> tuple[int, dict | None, str]:
     timeout = http_timeout()
-    async with aiohttp.ClientSession(timeout=timeout, trust_env=False) as direct:
+    async with client_session(timeout=timeout, trust_env=False) as direct:
         async with direct.post(url, json=payload, headers=headers, timeout=timeout) as resp:
             raw = await resp.text()
             body: dict | None = None
@@ -341,11 +342,13 @@ def _complete_ensure_prototype_payload(payload: dict) -> dict:
         billing_interval = "monthly"
     else:
         billing_interval = ext_str("billing_interval", billing_interval, strip=False).strip() or "monthly"
-    qr_platforms = src.get("qr_platforms")
-    if qr_platforms is None:
-        qr_platforms = []
+    raw_whatsapp_qr = src.get("whatsapp_qr")
+    if raw_whatsapp_qr is None:
+        whatsapp_qr = False
     else:
-        qr_platforms = ext_list("qr_platforms", qr_platforms)
+        whatsapp_qr = ext_bool("whatsapp_qr", raw_whatsapp_qr)
+    if whatsapp_qr and not is_local:
+        raise ExternalError("whatsapp_qr is only valid for local prototypes")
     private = src.get("private")
     if private is None:
         private = False
@@ -368,7 +371,8 @@ def _complete_ensure_prototype_payload(payload: dict) -> dict:
         "type": "subscription",
         "billing_interval": billing_interval,
         "is_local": is_local,
-        "qr_platforms": qr_platforms,
+        "whatsapp_qr": whatsapp_qr,
+        "qr_platforms": ["whatsapp"] if whatsapp_qr else [],
         "terms_of_use": _optional_str_field(src, "terms_of_use", ""),
         "privacy_policy": _optional_str_field(src, "privacy_policy", ""),
         "call_support": call_support,
@@ -423,13 +427,13 @@ def _payload_from_prototype_entry(entry: dict) -> dict[str, object]:
         "terms_of_use": "terms_of_use",
         "privacy_policy": "privacy_policy",
         "call_support": "call_support",
-        "qr_platforms": "qr_platforms",
+        "whatsapp_qr": "whatsapp_qr",
     }
     for src, dst in mapping.items():
         if src not in entry:
             continue
         val = entry[src]
-        if isinstance(val, str) and not val.strip() and src not in ("private", "is_local", "call_support"):
+        if isinstance(val, str) and not val.strip() and src not in ("private", "is_local", "call_support", "whatsapp_qr"):
             continue
         payload[dst] = val
     return payload
@@ -493,7 +497,7 @@ async def sync_prototype(
     consul_username, consul_password = _require_consul_credentials(config)
 
     cookie_jar = aiohttp.CookieJar(unsafe=True)
-    async with aiohttp.ClientSession(cookie_jar=cookie_jar, timeout=http_timeout(), trust_env=True) as session:
+    async with client_session(cookie_jar=cookie_jar, timeout=http_timeout(), trust_env=True) as session:
         await _sign_in(session=session, consul_url=consul_url, username=consul_username, password=consul_password)
 
         old_text = raw.decode("utf-8")
@@ -625,7 +629,7 @@ def _run_update_token(args: argparse.Namespace) -> int:
 
     async def run_update():
         cookie_jar = aiohttp.CookieJar(unsafe=True)
-        async with aiohttp.ClientSession(cookie_jar=cookie_jar, timeout=http_timeout(), trust_env=True) as session:
+        async with client_session(cookie_jar=cookie_jar, timeout=http_timeout(), trust_env=True) as session:
             new_token = (args.prototype_token or "").strip()
 
             if new_token:
@@ -753,7 +757,7 @@ def _run_attach_prototype(args: argparse.Namespace) -> int:
 
     async def run_attach():
         cookie_jar = aiohttp.CookieJar(unsafe=True)
-        async with aiohttp.ClientSession(cookie_jar=cookie_jar, timeout=http_timeout(), trust_env=True) as session:
+        async with client_session(cookie_jar=cookie_jar, timeout=http_timeout(), trust_env=True) as session:
             prototype_id = args.prototype_id
             token = (args.prototype_token or "").strip()
             name = (args.prototype_name or "").strip() or None

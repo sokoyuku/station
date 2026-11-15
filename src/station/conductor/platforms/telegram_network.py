@@ -5,6 +5,7 @@ from typing import Iterable
 
 import aiohttp
 from station import logger
+from station.client.retry import client_session
 from station.timeouts import wait
 from station.conductor.util import ext_str
 from station.prototypes.boundary import ext_dict, ext_list
@@ -79,7 +80,7 @@ async def _query_doh_provider(session: aiohttp.ClientSession, provider: dict) ->
 
 async def discover_fallback_ips() -> list[str]:
     timeout = aiohttp.ClientTimeout(total=_DOH_TIMEOUT)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
+    async with client_session(timeout=timeout) as session:
         doh_tasks = [_query_doh_provider(session, p) for p in _DOH_PROVIDERS]
         async def _system_dns():
             return await wait(asyncio.to_thread(_resolve_system_dns), _DOH_TIMEOUT, "telegram system dns")

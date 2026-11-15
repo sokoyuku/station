@@ -33,6 +33,8 @@ def _sighup_diffs(current: Config, loaded: Config) -> list[str]:
         "whatsapp_cloud_api_url",
         current.whatsapp_cloud_api_url != loaded.whatsapp_cloud_api_url,
     )
+    _mark(applied, "whatsapp_ws_url", current.whatsapp_ws_url != loaded.whatsapp_ws_url)
+    _mark(applied, "whatsapp_cert_url", current.whatsapp_cert_url != loaded.whatsapp_cert_url)
     _mark(applied, "qq_api_url", current.qq_api_url != loaded.qq_api_url)
     _mark(applied, "qq_token_url", current.qq_token_url != loaded.qq_token_url)
     _mark(applied, "consul_url", current.consul_url != loaded.consul_url)
@@ -191,6 +193,9 @@ def apply_reloaded_config(app, result: dict[str, Any]) -> None:
 
     station = app["_station"]
     station.config = new_config
+    local_conductor = app.get("local_conductor")
+    if local_conductor is not None:
+        local_conductor.config = new_config
 
     tenants = app["tenants"]
     primary = tenants.primary

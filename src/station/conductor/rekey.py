@@ -5,6 +5,7 @@ import aiohttp
 from cryptography.exceptions import InvalidTag
 
 from station import logger
+from station.client.retry import client_session
 from station.conductor.crypto import (
     ENCRYPTED_TOKEN_PREFIX,
     decrypt_if_encrypted,
@@ -349,7 +350,7 @@ async def rekey_local_secrets(*, config, username, password, old_private_key_pat
     old_path = (old_private_key_path or "").strip()
     old_key = None
     cookie_jar = aiohttp.CookieJar(unsafe=True)
-    async with aiohttp.ClientSession(cookie_jar=cookie_jar, timeout=http_timeout(), trust_env=True) as session:
+    async with client_session(cookie_jar=cookie_jar, timeout=http_timeout(), trust_env=True) as session:
         await _sign_in(session, consul_url, username, password)
         for attempt in range(_ATTEMPTS):
             status, body = await _post(session, consul_url, "/api/local_conductor/list_local_secrets", {})

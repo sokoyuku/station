@@ -2,6 +2,7 @@ import asyncio
 from dataclasses import dataclass, field
 
 from station import logger
+from station.client.retry import is_retryable_error
 from station.prototypes.chat_history import clear_chat_history
 from station.timeouts import PROCESS_STOP_TIMEOUT_S, BoundedLock, wait
 
@@ -77,21 +78,18 @@ class PrototypeBridgeWorker:
             raise
         except Exception as e:
             self._on_bridge_worker_error(state)
-            logger.error(
-                "unexpected where=%s model_id=%s acct_id=%s chat_id=%s error=%s",
-                self._bridge_worker_name,
-                self.model_id,
-                acct_id,
-                chat_id,
-                e,
-                exc_info=e,
-            )
-            await self.send_outbound(
-                text=self._bridge_worker_error_text(e),
-                chat_id=chat_id,
-                acct_id=acct_id,
-                platform=state.platform,
-                chat_type=state.chat_type)
+            self._log_worker_error(e, acct_id=acct_id, chat_id=chat_id, where=self._bridge_worker_name)
+            try:
+                await self.send_outbound(
+                    text=self._bridge_worker_error_text(e),
+                    chat_id=chat_id,
+                    acct_id=acct_id,
+                    platform=state.platform,
+                    chat_type=state.chat_type)
+            except asyncio.CancelledError:
+                raise
+            except Exception as notify_error:
+                self._log_worker_error(notify_error, acct_id=acct_id, chat_id=chat_id, where="%s-notify" % self._bridge_worker_name)
         finally:
             async with state.guard:
                 if state.worker_task is current_task:
@@ -101,6 +99,27 @@ class PrototypeBridgeWorker:
 
     def _on_bridge_worker_error(self, state):
         state.busy = False
+
+    def _log_worker_error(self, error, *, acct_id, chat_id, where):
+        if is_retryable_error(error):
+            logger.error(
+                "retry exhausted where=%s model_id=%s acct_id=%s chat_id=%s error=%s",
+                where,
+                self.model_id,
+                acct_id,
+                chat_id,
+                error,
+            )
+            return
+        logger.error(
+            "unexpected where=%s model_id=%s acct_id=%s chat_id=%s error=%s",
+            where,
+            self.model_id,
+            acct_id,
+            chat_id,
+            error,
+            exc_info=error,
+        )
 
     def _bridge_worker_should_respawn(self, state):
         return (not state.busy) and bool(state.pending_messages)

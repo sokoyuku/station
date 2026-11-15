@@ -2,14 +2,12 @@ import re
 
 from station.conductor.util import ext_str
 
-_AT_ALL_RE = re.compile(r"(?i)(?:^|\s)@all\b")
+_DEVICE_SUFFIX_RE = re.compile(r":\d+(?=@|$)")
 
 
 def normalize_whatsapp_id(value):
     text = ext_str(value, "whatsapp_id").strip()
-    if ":" in text and "@" in text:
-        text = text.replace(":", "@", 1)
-    return text
+    return _DEVICE_SUFFIX_RE.sub("", text)
 
 
 def whatsapp_id_keys(value):
@@ -71,8 +69,6 @@ def whatsapp_mentions_bot(
     if broadcast:
         return False
     body = "%s\n%s" % (ext_str(text, "text"), ext_str(caption, "caption"))
-    if _AT_ALL_RE.search(body):
-        return True
     bots = [normalize_whatsapp_id(item) for item in (bot_ids or []) if normalize_whatsapp_id(item)]
     if not bots:
         return False

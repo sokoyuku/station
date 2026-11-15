@@ -95,7 +95,7 @@ class PairManager:
             )
             state["handle"] = handle
 
-        deadline = time.time() + 45
+        deadline = time.time() + 20
         while time.time() < deadline:
             if state.get("qr"):
                 break

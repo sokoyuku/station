@@ -214,10 +214,11 @@ class DiscordAdapter(LocalPlatformAdapter):
         return await self.io.send_message(
             token=token,
             channel_id=chat_id,
-            content=prepare_outbound_caption("discord", caption or ""),
+            content="" if method == "send_voice" else prepare_outbound_caption("discord", caption or ""),
             file_bytes=bytes_to_send,
             filename=(payload.get("file_name") or "file"),
             reply_to=reply_to,
+            voice=method == "send_voice",
         )
 
     async def send_discord_voice(

@@ -139,6 +139,17 @@ def whatsapp_bridge_dir(*, need_pair=False):
             return c
     return candidates[0]
 
+def whatsapp_process_env(config):
+    env = os.environ.copy()
+    url = config.whatsapp_ws_url.strip()
+    if url:
+        env["WHATSAPP_WS_URL"] = url
+    cert = config.whatsapp_cert_url.strip()
+    if cert:
+        env["WHATSAPP_CERT_URL"] = cert
+    return env
+
+
 def node_bin():
     env = os.environ.get("LOCAL_CONDUCTOR_NODE")
     if env is not None and env.strip():

@@ -37,7 +37,7 @@ class ServerConfig:
     inbound_workers: int = 4
     inbound_queue: int = 16384
     inbound_batch: int = 8
-    inbound_at_least_once: bool = False
+    inbound_at_least_once: bool = True
     outbound_concurrency: int = 0
     listen_backlog: int = 4096
     isolate_after: int = 3
@@ -120,6 +120,8 @@ class Config:
         self.telegram_webhook_secret = self._get_str("TELEGRAM_WEBHOOK_SECRET", "").strip()
         self.discord_api_url = self._get_str("DISCORD_API_URL", "").strip().rstrip("/")
         self.whatsapp_cloud_api_url = self._get_str("WHATSAPP_CLOUD_API_URL", "").strip().rstrip("/")
+        self.whatsapp_ws_url = self._get_str("WHATSAPP_WS_URL", "").strip()
+        self.whatsapp_cert_url = self._get_str("WHATSAPP_CERT_URL", "").strip()
         self.qq_api_url = self._get_str("QQ_API_URL", "").strip().rstrip("/")
         self.qq_token_url = self._get_str("QQ_TOKEN_URL", "").strip()
         self.database = self._load_database_config()
@@ -218,7 +220,7 @@ class Config:
         if listen_backlog <= 0:
             raise ExternalError("STATION_LISTEN_BACKLOG must be > 0")
 
-        inbound_at_least_once = self._get_bool("STATION_INBOUND_AT_LEAST_ONCE", False)
+        inbound_at_least_once = self._get_bool("STATION_INBOUND_AT_LEAST_ONCE", True)
 
         isolate_after = self._get_int("STATION_INSTANCE_ISOLATE_AFTER", 3)
         if isolate_after <= 0:

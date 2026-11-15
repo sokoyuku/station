@@ -58,7 +58,7 @@ class CursorLaunchSettings:
             or ext_mapping_get(workspace, "dir", (str,), "")
             or default_workspace
         )
-        workspace_path = os.path.expanduser(workspace_dir)
+        workspace_path = os.path.realpath(os.path.expanduser(workspace_dir))
 
         _, model_id = split_provider_model(
             ext_mapping_get(model, "model", (str,), "") or DEFAULT_MODEL,

@@ -1,4 +1,5 @@
 import asyncio
+import math
 import os
 from dataclasses import dataclass
 from typing import Any
@@ -6,6 +7,7 @@ from urllib.parse import urlparse
 
 import aiohttp
 
+from station.client.retry import CircuitOpen, RetryableError, client_connector, client_session, is_retryable_error, is_transient_status, retry_transient
 from station.conductor.crypto import decrypt_if_encrypted
 from station.conductor.platforms import guidance
 from station.conductor.platforms.group_settings import telegram_group_notice
@@ -244,36 +246,31 @@ def _utf16_slice(text, offset, length):
     return encoded[start:end].decode("utf-16-le")
 
 
-def telegram_message_mentions_bot(msg, bot_username=""):
+def telegram_message_mentions_bot(msg, bot_username="", bot_user_id=""):
     if not msg:
         return False
     bot_username = (bot_username or "").strip().lstrip("@")
+    bot_user_id = str(bot_user_id or "").strip()
     text = ext_str(msg.get("text"), "text")
     caption = ext_str(msg.get("caption"), "caption")
-    if _telegram_entities_mention_bot(text, msg.get("entities"), bot_username):
+    text_entities = msg.get("entities")
+    caption_entities = msg.get("caption_entities")
+    if _telegram_entities_mention_bot(text, text_entities, bot_username, bot_user_id):
         return True
-    if _telegram_entities_mention_bot(caption, msg.get("caption_entities"), bot_username):
+    if _telegram_entities_mention_bot(caption, caption_entities, bot_username, bot_user_id):
         return True
-    if bot_username:
-        needle = "@" + bot_username.lower()
-        if needle in text.lower() or needle in caption.lower():
-            return True
-    rt = msg.get("reply_to_message")
-    if rt is not None:
-        rt = ext_dict("telegram reply_to_message", rt)
-        sender = rt.get("from")
-        if sender is not None:
-            sender = ext_dict("telegram reply from", sender)
-            reply_username = ext_str(sender.get("username"), "username").strip()
-            if bot_username and reply_username.lower() == bot_username.lower():
-                return True
-            if not bot_username and bool(sender.get("is_bot")):
-                return True
+    if not bot_username:
+        return False
+    needle = "@" + bot_username.lower()
+    if not text_entities and needle in text.lower():
+        return True
+    if not caption_entities and needle in caption.lower():
+        return True
     return False
 
 
-def _telegram_entities_mention_bot(text, entities, bot_username):
-    if not bot_username or entities is None:
+def _telegram_entities_mention_bot(text, entities, bot_username, bot_user_id=""):
+    if entities is None:
         return False
     entities = ext_list("telegram entities", entities)
     for item in entities:
@@ -283,7 +280,7 @@ def _telegram_entities_mention_bot(text, entities, bot_username):
             offset = ext_int(item.get("offset"), "offset")
             length = ext_int(item.get("length"), "length")
             token = _utf16_slice(text, offset, length).strip().lstrip("@")
-            if token.lower() == bot_username.lower():
+            if bot_username and token.lower() == bot_username.lower():
                 return True
             continue
         if kind == "text_mention":
@@ -291,10 +288,31 @@ def _telegram_entities_mention_bot(text, entities, bot_username):
             if user is None:
                 continue
             user = ext_dict("telegram entity user", user)
-            username = ext_str(user.get("username"), "username").strip()
-            if username.lower() == bot_username.lower():
+            user_id = ext_id(user.get("id"), "user.id").strip()
+            if bot_user_id and user_id == bot_user_id:
                 return True
+            continue
+        if kind == "bot_command":
+            offset = ext_int(item.get("offset"), "offset")
+            length = ext_int(item.get("length"), "length")
+            token = _utf16_slice(text, offset, length)
+            if "@" in token:
+                suffix = token.rsplit("@", 1)[-1].strip()
+                if bot_username and suffix.lower() == bot_username.lower():
+                    return True
     return False
+
+
+_LIVE_REFRESH_MIN_METERS = 75.0
+_LIVE_REFRESH_MIN_SECONDS = 900.0
+_LIVE_SHARE_CAP = 256
+
+
+def _meters_between(lat1, lon1, lat2, lon2):
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dp, dl = p2 - p1, math.radians(lon2 - lon1)
+    h = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+    return 2 * 6_371_000 * math.asin(math.sqrt(min(1.0, h)))
 
 
 def _telegram_person_sender(sender):
@@ -311,6 +329,9 @@ class TelegramIO:
         self._fallback_ips: list[str] = parse_fallback_ip_env(os.environ.get("TELEGRAM_FALLBACK_IPS"))
         self._webhook_configured: dict[str, float] = {}
         self._conflict_count = 0
+        self._live_shares: dict[tuple[str, str], tuple[float | None, float, float]] = {}
+        self._live_order: list[tuple[str, str]] = []
+        self._bot_user_ids: dict[str, str] = {}
 
     def _api_base(self) -> str:
         raw = self.conductor.config.telegram_api_url.strip()
@@ -351,16 +372,16 @@ class TelegramIO:
         host = self._api_host()
         if host != _TELEGRAM_API_HOST:
             timeout = aiohttp.ClientTimeout(total=60)
-            self._api_session = aiohttp.ClientSession(timeout=timeout, trust_env=True)
+            self._api_session = client_session(timeout=timeout, trust_env=True)
             self._network_ready = True
             return
         auto = (os.environ.get("TELEGRAM_FALLBACK_AUTO_DISCOVER") or "").strip() not in ("", "0", "false", "False")
         if auto and not self._fallback_ips:
             self._fallback_ips = await discover_fallback_ips()
         resolver = TelegramFallbackResolver(None, self._fallback_ips)
-        connector = aiohttp.TCPConnector(resolver=resolver, ttl_dns_cache=30)
+        connector = client_connector(resolver=resolver, ttl_dns_cache=30)
         timeout = aiohttp.ClientTimeout(total=60)
-        self._api_session = aiohttp.ClientSession(connector=connector, timeout=timeout, trust_env=True)
+        self._api_session = client_session(connector=connector, timeout=timeout, trust_env=True)
         self._network_ready = True
 
     @property
@@ -400,6 +421,8 @@ class TelegramIO:
         if ext_str(chat.get("type"), "type").strip().lower() == "channel":
             return None
         if telegram_topic_service_message(msg):
+            return None
+        if self._redundant_live_refresh(msg):
             return None
         chat_id_str = platform_chat_id_for_message(ext_id(chat_id, "chat.id", allow_none=False), effective_message_thread_id(msg))
         chat_type = ext_str(chat.get("type"), "type").strip()
@@ -535,6 +558,48 @@ class TelegramIO:
             sender_name=sender_name,
             sender_username=sender_username,
         )
+
+    def _redundant_live_refresh(self, msg: dict) -> bool:
+        location = msg.get("location")
+        if location is None:
+            return False
+        location = ext_dict("telegram location", location)
+        if location.get("latitude") is None or location.get("longitude") is None:
+            return False
+        chat = ext_dict("telegram message chat", msg.get("chat"))
+        key = (ext_id(chat.get("id"), "chat.id"), ext_id(msg.get("message_id"), "message_id"))
+        edit_date = msg.get("edit_date")
+        edited = edit_date is not None
+        live = location.get("live_period") is not None
+        if edited and not live:
+            self._live_shares.pop(key, None)
+            if key in self._live_order:
+                self._live_order.remove(key)
+            return True
+        if not live:
+            return False
+        lat = float(location.get("latitude"))
+        lon = float(location.get("longitude"))
+        now = float(edit_date) if edited else None
+        previous = self._live_shares.get(key)
+        redundant = edited and (
+            previous is None
+            or (
+                now is not None
+                and previous[0] is not None
+                and now - previous[0] < _LIVE_REFRESH_MIN_SECONDS
+                and _meters_between(previous[1], previous[2], lat, lon) < _LIVE_REFRESH_MIN_METERS
+            )
+        )
+        if not redundant or previous is None:
+            self._live_shares[key] = (now, lat, lon)
+            if key in self._live_order:
+                self._live_order.remove(key)
+            self._live_order.append(key)
+            while len(self._live_order) > _LIVE_SHARE_CAP:
+                dropped = self._live_order.pop(0)
+                self._live_shares.pop(dropped, None)
+        return redundant
 
     def _location_text(self, msg: dict) -> str:
         venue = msg.get("venue")
@@ -765,6 +830,15 @@ class TelegramIO:
         async with self.session.post(url, json=payload) as resp:
             body = await resp.json(content_type=None)
         body = ext_dict('telegram sendChatAction body', body)
+        if body.get("ok"):
+            return True
+        desc = ext_str(body.get("description"), "description")
+        chat = str(api_chat_id)
+        if "message_thread_id" in payload and chat and not chat.startswith("-") and self._is_thread_not_found_error(desc):
+            payload.pop("message_thread_id", None)
+            async with self.session.post(url, json=payload) as resp:
+                body = await resp.json(content_type=None)
+            body = ext_dict("telegram sendChatAction body", body)
         return bool(body.get("ok"))
 
     async def download_file(self, *, token: str, file_id: str) -> bytes | None:
@@ -824,7 +898,35 @@ class TelegramIO:
         result = body.get("result")
         result = ext_dict("telegram getMe result", result)
         can_read = ext_bool(result.get("can_read_all_group_messages"), "can_read_all_group_messages")
+        bot_id = ext_id(result.get("id"), "id").strip()
+        if bot_id and bot_id != "0":
+            self._bot_user_ids[token] = bot_id
         return telegram_group_notice(can_read)
+
+    async def _bot_user_id(self, token: str) -> str:
+        token = (token or "").strip()
+        if not token:
+            return ""
+        cached = self._bot_user_ids.get(token)
+        if cached:
+            return cached
+        await self._ensure_network_ready()
+        url = f"{self._api_base()}/bot{token}/getMe"
+        try:
+            async with self.session.get(url) as resp:
+                body = await resp.json(content_type=None)
+                status = int(resp.status)
+        except aiohttp.ClientError:
+            return ""
+        body = ext_dict("telegram getMe body", body)
+        if status != 200 or not body.get("ok"):
+            return ""
+        result = ext_dict("telegram getMe result", body.get("result"))
+        bot_id = ext_id(result.get("id"), "id").strip()
+        if not bot_id or bot_id == "0":
+            return ""
+        self._bot_user_ids[token] = bot_id
+        return bot_id
 
     def _rate_limit_delay(self, status, body: dict) -> int:
         code = 0
@@ -842,6 +944,32 @@ class TelegramIO:
             return max(1, retry_after)
         return 0
 
+    async def _post_telegram(self, *, url, payload, file_bytes, file_field, filename):
+        async def _once():
+            if file_bytes is None:
+                async with self.session.post(url, json=payload) as resp:
+                    body = await resp.json(content_type=None)
+                    status = int(resp.status)
+            else:
+                data = aiohttp.FormData()
+                for k, v in payload.items():
+                    if v is None:
+                        continue
+                    data.add_field(k, str(v))
+                field = file_field or "file"
+                name = (filename or "").strip() or "file"
+                data.add_field(field, file_bytes, filename=name)
+                async with self.session.post(url, data=data) as resp:
+                    body = await resp.json(content_type=None)
+                    status = int(resp.status)
+            body = ext_dict("telegram send body", body)
+            delay = self._rate_limit_delay(status, body)
+            if delay or is_transient_status(status):
+                raise RetryableError("telegram status=%s" % status, delay=delay or None)
+            return body
+
+        return await retry_transient(_once, circuit_name="telegram")
+
     async def _send(
         self,
         *,
@@ -858,30 +986,27 @@ class TelegramIO:
         await self._ensure_network_ready()
         url = f"{self._api_base()}/bot{token}/{api_method}"
         last_desc = ""
+        thread_same_retry = False
         for _ in range(4):
-            if file_bytes is None:
-                async with self.session.post(url, json=payload) as resp:
-                    body = await resp.json(content_type=None)
-                    status = int(resp.status)
-            else:
-                data = aiohttp.FormData()
-                for k, v in payload.items():
-                    if v is None:
-                        continue
-                    data.add_field(k, str(v))
-                field = (file_field or "file")
-                name = (filename or "").strip() or "file"
-                data.add_field(field, file_bytes, filename=name)
-                async with self.session.post(url, data=data) as resp:
-                    body = await resp.json(content_type=None)
-                    status = int(resp.status)
+            try:
+                body = await self._post_telegram(
+                    url=url,
+                    payload=payload,
+                    file_bytes=file_bytes,
+                    file_field=file_field,
+                    filename=filename,
+                )
+            except CircuitOpen as e:
+                logger.error("telegram send circuit open method=%s error=%s", api_method, e)
+                return False, str(e)
+            except Exception as e:
+                if not is_retryable_error(e):
+                    raise
+                logger.error("telegram send retry exhausted method=%s error=%s", api_method, e)
+                return False, str(e)
             body = ext_dict('telegram send body', body)
             if body.get("ok"):
                 return True, ""
-            delay = self._rate_limit_delay(status, body)
-            if delay:
-                await asyncio.sleep(min(delay, 120))
-                continue
             last_desc = ext_str(body.get("description"), "description")
             if self._is_reply_not_found_error(last_desc) and (
                 "reply_to_message_id" in payload or "reply_parameters" in payload
@@ -891,8 +1016,15 @@ class TelegramIO:
                 payload.pop("reply_parameters", None)
                 continue
             if self._is_thread_not_found_error(last_desc) and "message_thread_id" in payload:
+                if not thread_same_retry:
+                    thread_same_retry = True
+                    continue
                 payload = dict(payload)
                 payload.pop("message_thread_id", None)
+                chat = str(payload.get("chat_id") or "")
+                if chat and not chat.startswith("-"):
+                    payload.pop("reply_to_message_id", None)
+                    payload.pop("reply_parameters", None)
                 continue
             return False, last_desc
         return False, last_desc
@@ -900,34 +1032,16 @@ class TelegramIO:
     @staticmethod
     def _is_parse_mode_error(desc: str) -> bool:
         msg = (desc or "").lower()
-        needles = (
-            "parse",
-            "can't find end",
-            "cant find end",
-            "can't parse entities",
-            "cant parse entities",
-            "entity",
-            "entities",
-            "unsupported start tag",
-            "character is reserved",
-            "nested entities",
-            "must be escaped",
-            "begin with a valid",
-            "unexpected end of",
-            "unmatched",
-        )
-        return any(n in msg for n in needles)
+        if "timeout" in msg or "connection" in msg or msg.endswith("eof"):
+            return False
+        if "bad request" not in msg and "can't parse" not in msg and "cant parse" not in msg:
+            return False
+        return "parse" in msg or "entit" in msg or "markdown" in msg
 
     @staticmethod
     def _is_thread_not_found_error(desc: str) -> bool:
         msg = (desc or "").lower()
-        return (
-            "thread not found" in msg
-            or "message thread not found" in msg
-            or "message thread_id is invalid" in msg
-            or "topic_closed" in msg
-            or ("message_thread_id" in msg and "invalid" in msg)
-        )
+        return "thread not found" in msg
 
     @staticmethod
     def _is_reply_not_found_error(desc: str) -> bool:
@@ -948,7 +1062,7 @@ class TelegramIO:
         raw = reply_to.strip()
         if not raw.isdigit():
             return {}
-        return {"reply_to_message_id": int(raw)}
+        return {"reply_parameters": {"message_id": int(raw)}}
 
     async def send_message(
         self,
@@ -1042,10 +1156,8 @@ class TelegramIO:
                         stem = (filename or "voice").rsplit(".", 1)[0] or "voice"
                         filename = stem + ".ogg"
                 else:
-                    logger.warning("ffmpeg missing; sending voice as audio")
-                    method = "send_audio"
-                    stem = (filename or "voice").rsplit(".", 1)[0] or "voice"
-                    filename = stem + ".mp3"
+                    logger.warning("ffmpeg missing; sending voice bytes as a document")
+                    method = "send_document"
         field = _METHOD_MEDIA_FIELD.get(method)
         if not field:
             return False
@@ -1065,11 +1177,17 @@ class TelegramIO:
         payload.update(_thread_payload(thread_id=thread_from_chat))
         prepared_caption = ""
         if caption and method != "send_sticker":
-            prepared_caption = guidance.prepare_outbound_caption("telegram", caption)
-            if prepared_caption:
-                payload["caption"] = prepared_caption
-                if guidance.uses_telegram_parse_mode(caption):
+            raw_caption = guidance.truncate_to_limit(caption, guidance.MAX_TELEGRAM_CAPTION_LENGTH, guidance.utf16_len)
+            if method in ("send_voice", "send_audio"):
+                formatted = guidance.prepare_outbound_caption("telegram", caption)
+                if guidance.uses_telegram_parse_mode(caption) and guidance.utf16_len(formatted) <= guidance.MAX_TELEGRAM_CAPTION_LENGTH:
+                    prepared_caption = formatted
+                    payload["caption"] = formatted
                     payload["parse_mode"] = "MarkdownV2"
+                else:
+                    payload["caption"] = raw_caption
+            else:
+                payload["caption"] = raw_caption
         payload.update(self._reply_to_payload(reply_to))
         if file_bytes is None:
             ref = (media_ref or "").strip()
@@ -1173,14 +1291,18 @@ class TelegramIO:
         if parsed.is_edit:
             body["is_edit"] = True
         bot_username = ""
+        bot_user_id = ""
         acct = await self.conductor.db.get_local_account(acct_id)
         if acct:
             bot_username = ext_str(acct.get("username") or acct.get("acct_username"), "username").strip()
+            enc = (acct.get("encrypted_token") or "").strip()
+            token, _ = decrypt_if_encrypted(self.conductor.private_key, enc)
+            bot_user_id = await self._bot_user_id((token or "").strip())
         msg = update.get("message")
         if msg is None:
             msg = update.get("edited_message")
         if msg is not None:
-            body["mentioned"] = telegram_message_mentions_bot(ext_dict("telegram message", msg), bot_username)
+            body["mentioned"] = telegram_message_mentions_bot(ext_dict("telegram message", msg), bot_username, bot_user_id)
         else:
             body["mentioned"] = bool(parsed.callback_query_id)
         if not parsed.text and not parsed.caption and not parsed.attachments:
@@ -1254,6 +1376,9 @@ class TelegramIO:
             except asyncio.CancelledError:
                 raise
             except Exception as e:
-                logger.error("unexpected where=telegram_poller acct_id=%s error=%s", acct_id, e, exc_info=e)
+                if is_retryable_error(e):
+                    logger.error("telegram poll retry exhausted acct_id=%s error=%s", acct_id, e)
+                else:
+                    logger.error("unexpected where=telegram_poller acct_id=%s error=%s", acct_id, e, exc_info=e)
                 await asyncio.sleep(2)
                 continue

@@ -18,6 +18,7 @@ from station.conductor.platforms.keyboard import join_text_and_keyboard, parse_k
 from station.conductor.platforms.policy import allows_media
 from station.conductor.util import apply_sender, attachment_type_from_meta, ext_id, ext_int, ext_str
 from station import logger
+from station.client.retry import RetryableError, client_session, is_transient_status, retry_transient
 from station.timeouts import IO_TIMEOUT_S, BoundedLock, wait, ws_timeout
 from station.errors import ExternalError
 from station.prototypes.boundary import ext_dict, ext_float, ext_list
@@ -50,7 +51,7 @@ MEDIA_TYPE_VIDEO = 2
 MEDIA_TYPE_VOICE = 3
 MEDIA_TYPE_FILE = 4
 
-INLINE_UPLOAD_MAX = 9 * 1024 * 1024
+INLINE_UPLOAD_MAX = 5 * 1000 * 1000
 DEDUP_WINDOW_SECONDS = 300
 DEDUP_MAX_SIZE = 1000
 RECONNECT_BACKOFF = [2, 5, 10, 30, 60]
@@ -154,7 +155,17 @@ def _parse_interaction(d):
         "button_data": ext_str(resolved.get("button_data"), "button_data"),
         "button_id": ext_str(resolved.get("button_id"), "button_id"),
         "button_label": ext_str(resolved.get("button_label"), "button_label"),
+        "user_id": ext_id(resolved.get("user_id"), "user_id"),
     }
+
+def _qq_interaction_needs_ack(d):
+    if not isinstance(d, dict) or "type" not in d or d.get("type") in (None, ""):
+        return True
+    try:
+        n = int(d.get("type"))
+    except (TypeError, ValueError):
+        return True
+    return n in (0, 11, 12)
 
 class QQIO:
     def __init__(self, conductor):
@@ -284,10 +295,10 @@ class QQIO:
                     a = ext_dict('qq quoted attachment', a)
                     quote_atts.append(a)
         if not lines and not quote_atts:
-            return "", reply_to, []
+            return "", "", []
         if not lines:
-            return "[Quoted message]: (attachment)", reply_to, quote_atts
-        return "[Quoted message]:\n" + "\n".join(lines), reply_to, quote_atts
+            return "[Quoted message]: (image)", "", quote_atts
+        return "[Quoted message]: " + " ".join(lines), "", quote_atts
 
     @staticmethod
     def _strip_at_mention(content):
@@ -345,35 +356,42 @@ class QQIO:
         }
 
     async def _api_request(self, *, token, method, path, body=None, timeout=30.0, server=None):
-        app_id, client_secret, access = await self._creds_from_token(token)
+        _, _, access = await self._creds_from_token(token)
         url = f"{self._api_base(server)}{path}"
-        async with self.session.request(
-            method.upper(),
-            url,
-            headers=self._auth_headers(access),
-            json=body,
-            timeout=aiohttp.ClientTimeout(total=timeout),
-        ) as resp:
-            try:
-                data = await resp.json(content_type=None)
-            except (aiohttp.ContentTypeError, json.JSONDecodeError, ValueError):
-                raw = await resp.text()
+
+        async def _once():
+            async with self.session.request(
+                method.upper(),
+                url,
+                headers=self._auth_headers(access),
+                json=body,
+                timeout=aiohttp.ClientTimeout(total=timeout),
+            ) as resp:
                 status = int(resp.status)
+                try:
+                    data = await resp.json(content_type=None)
+                except (aiohttp.ContentTypeError, json.JSONDecodeError, ValueError) as e:
+                    if is_transient_status(status):
+                        raise RetryableError("qq body status=%s path=%s error=%s" % (status, path, e)) from e
+                    raw = await resp.text()
+                    if status >= 400:
+                        if status in (401, 403):
+                            popped_app, _ = parse_qq_credentials(token)
+                            self._access_by_app.pop(popped_app, None)
+                        raise RuntimeError("QQ API [%s] %s: %s" % (status, path, raw[:500]))
+                    raise ExternalError("qq api response must be json dict")
+                if is_transient_status(status):
+                    raise RetryableError("qq status=%s path=%s" % (status, path))
+                data = ext_dict('qq api response', data)
                 if status >= 400:
                     if status in (401, 403):
-                        app_id, _ = parse_qq_credentials(token)
-                        self._access_by_app.pop(app_id, None)
-                    raise RuntimeError(f"QQ API [{status}] {path}: {raw[:500]}")
-                raise ExternalError("qq api response must be json dict")
-            data = ext_dict('qq api response', data)
-            status = int(resp.status)
-            if status >= 400:
-                if status in (401, 403):
-                    app_id, _ = parse_qq_credentials(token)
-                    self._access_by_app.pop(app_id, None)
-                msg = data.get("message", data)
-                raise RuntimeError(f"QQ API [{status}] {path}: {msg}")
-            return data
+                        popped_app, _ = parse_qq_credentials(token)
+                        self._access_by_app.pop(popped_app, None)
+                    msg = data.get("message", data)
+                    raise RuntimeError("QQ API [%s] %s: %s" % (status, path, msg))
+                return data
+
+        return await retry_transient(_once, circuit_name="qq")
 
     async def group_message_notice(self, *, token, chat_id) -> str:
         chat_id = (chat_id or "").strip()
@@ -492,8 +510,6 @@ class QQIO:
         chat_id = (chat_id or "").strip()
         if not chat_id:
             return False
-        if not reply_to:
-            reply_to = self._last_msgs(acct_id).get(chat_id)
         text = (content or "")
         if not text.strip() and keyboard is None:
             return True
@@ -553,7 +569,7 @@ class QQIO:
             body["url"] = url
         elif file_data:
             body["file_data"] = file_data
-        if file_type == MEDIA_TYPE_FILE and file_name:
+        if file_data and file_name:
             body["file_name"] = file_name
         return await self._api_request(token=token, method="POST", path=path, body=body, timeout=FILE_UPLOAD_TIMEOUT, server=server)
 
@@ -722,8 +738,6 @@ class QQIO:
         if native not in ("c2c", "group"):
             return False
         chat_type = native
-        if not reply_to:
-            reply_to = self._last_msgs(acct_id).get(chat_id)
         name = (filename or "file").strip() or "file"
         file_type = self._media_type_for_method(method, name)
         if file_bytes is not None:
@@ -741,7 +755,7 @@ class QQIO:
                     chat_id=chat_id,
                     file_type=file_type,
                     url=media_ref,
-                    file_name=name if file_type == MEDIA_TYPE_FILE else None,
+                    file_name=name,
                     server=server,
                 )
             elif file_bytes is not None:
@@ -753,7 +767,7 @@ class QQIO:
                         chat_id=chat_id,
                         file_type=file_type,
                         file_data=b64,
-                        file_name=name if file_type == MEDIA_TYPE_FILE else None,
+                        file_name=name,
                         server=server,
                     )
                 else:
@@ -790,6 +804,8 @@ class QQIO:
                 body["content"] = guidance.prepare_outbound_caption("qq", caption)
             if reply_to:
                 body["msg_id"] = reply_to
+                if not guidance.qq_markdown_enabled():
+                    body["message_reference"] = {"message_id": reply_to}
             path = f"/v2/users/{chat_id}/messages" if chat_type == "c2c" else f"/v2/groups/{chat_id}/messages"
             await self._api_request(token=token, method="POST", path=path, body=body, server=server)
             return True
@@ -803,6 +819,8 @@ class QQIO:
     def _is_voice(self, content_type, filename):
         ct = (content_type or "").strip().lower()
         fn = (filename or "").strip().lower()
+        if ct == "file":
+            return False
         if ct == "voice" or ct.startswith("audio/"):
             return True
         return any(fn.endswith(ext) for ext in _VOICE_EXTS)
@@ -963,9 +981,7 @@ class QQIO:
             filename = ext_str(a.get("filename"), "filename").strip()
             content_type = ext_str(a.get("content_type"), "content_type").strip()
             ct_lower = content_type.lower()
-            if ct_lower.startswith("image/webp") or filename.lower().endswith(".webp"):
-                att_type = "sticker"
-            elif self._is_voice(content_type, filename):
+            if self._is_voice(content_type, filename):
                 att_type = "voice"
             else:
                 att_type = attachment_type_from_meta(
@@ -1015,6 +1031,9 @@ class QQIO:
                 transcript = await self._voice_transcript(token=token, att=att)
                 if transcript:
                     block = f"[Voice] {transcript}"
+                    content = f"{content}\n\n{block}".strip() if content else block
+                elif (os.environ.get("QQ_STT_API_KEY") or "").strip():
+                    block = "[Voice] [语音识别失败]"
                     content = f"{content}\n\n{block}".strip() if content else block
         if not content:
             for a in atts:
@@ -1067,6 +1086,8 @@ class QQIO:
         msg_id = ext_id(d.get("id"), "id").strip()
         if self._is_seen(acct_id, msg_id):
             return
+        if msg_id:
+            self._mark_seen(acct_id, msg_id)
         content = ext_str(d.get("content"), "content").strip()
         author = d.get("author")
         if author is None:
@@ -1081,23 +1102,20 @@ class QQIO:
         atts = self._attachments_from_event(raw_atts)
 
         if event_type == "C2C_MESSAGE_CREATE":
-            user_openid = ext_str(
-                author.get("user_openid") or author.get("id"),
-                "user_openid",
-            ).strip()
+            user_openid = ext_str(author.get("user_openid"), "user_openid").strip()
             chat_id = user_openid
             text = content
             chat_kind = "c2c"
             user_id = user_openid
         elif event_type in ("GROUP_AT_MESSAGE_CREATE", "GROUP_MESSAGE_CREATE"):
             chat_id = ext_id(d.get("group_openid"), "group_openid").strip()
-            user_id = ext_str(author.get("member_openid") or author.get("id"), "member_openid").strip()
+            user_id = ext_str(author.get("member_openid"), "member_openid").strip()
             text = self._strip_at_mention(content) if event_type == "GROUP_AT_MESSAGE_CREATE" else content
             chat_kind = "group"
         elif event_type in ("GUILD_MESSAGE_CREATE", "GUILD_AT_MESSAGE_CREATE"):
             chat_id = ext_id(d.get("channel_id"), "channel_id").strip()
             user_id = ext_id(author.get("id"), "id").strip()
-            text = self._strip_at_mention(content) if event_type == "GUILD_AT_MESSAGE_CREATE" else content
+            text = content
             chat_kind = "guild"
         elif event_type == "DIRECT_MESSAGE_CREATE":
             chat_id = ext_id(d.get("guild_id"), "guild_id").strip()
@@ -1108,7 +1126,7 @@ class QQIO:
             return
         if not chat_id:
             return
-        quote_block, quote_reply, quote_atts = self._quoted_context(d)
+        quote_block, _, quote_atts = self._quoted_context(d)
         if quote_atts:
             for raw_q in quote_atts:
                 parsed_list = self._attachments_from_event([raw_q])
@@ -1122,7 +1140,7 @@ class QQIO:
                     if transcript:
                         if not transcript.startswith("[Voice]"):
                             transcript = f"[Voice] {transcript}"
-                        if not quote_block or quote_block == "[Quoted message]: (attachment)":
+                        if not quote_block or quote_block == "[Quoted message]: (image)":
                             quote_block = f"[Quoted message]:\n{transcript}"
                         else:
                             quote_block = f"{quote_block}\n{transcript}"
@@ -1135,10 +1153,8 @@ class QQIO:
         reply_to_text = ""
         if quote_block:
             text = f"{quote_block}\n\n{text}".strip() if text else quote_block
-            if quote_block.startswith("[Quoted message]:\n"):
-                reply_to_text = quote_block.split("\n", 1)[1].strip()
-            elif quote_block == "[Quoted message]: (attachment)":
-                reply_to_text = "(attachment)"
+            if quote_block.startswith("[Quoted message]: "):
+                reply_to_text = quote_block[len("[Quoted message]: ") :].split("\n", 1)[0].strip()
         location = d.get("location")
         if location is not None:
             location = ext_dict('qq message location', location)
@@ -1164,7 +1180,7 @@ class QQIO:
             "GUILD_AT_MESSAGE_CREATE",
             "AT_MESSAGE_CREATE",
         )
-        ok = await self._deliver(
+        await self._deliver(
             acct_id=acct_id,
             chat_id=chat_id,
             chat_kind=chat_kind if chat_kind != "dm" else "dm",
@@ -1175,14 +1191,11 @@ class QQIO:
             token=token,
             raw_attachments=raw_atts,
             raw=raw,
-            reply_to=quote_reply,
+            reply_to="",
             reply_to_text=reply_to_text,
             sender_username=ext_str(author.get("username"), "username").strip(),
             mentioned=mentioned,
         )
-        if ok:
-            self._mark_seen(acct_id, msg_id)
-
     async def _ack_interaction(self, *, token, interaction_id, server=None):
         await self._api_request(
             token=token,
@@ -1198,7 +1211,12 @@ class QQIO:
         interaction_id = event["id"]
         if not interaction_id:
             return
-        await self._ack_interaction(token=token, interaction_id=interaction_id, server=server)
+        msg_id = f"interaction:{interaction_id}"
+        if self._is_seen(acct_id, msg_id):
+            return
+        self._mark_seen(acct_id, msg_id)
+        if _qq_interaction_needs_ack(d):
+            await self._ack_interaction(token=token, interaction_id=interaction_id, server=server)
         scene = event["scene"]
         if scene == "c2c":
             chat_id = event["user_openid"]
@@ -1212,13 +1230,12 @@ class QQIO:
             chat_id = event["channel_id"] or event["guild_id"]
             chat_kind = "guild" if event["channel_id"] else "dm"
             user_id = event["user_openid"] or event["group_member_openid"]
+            if scene == "guild" and event["user_id"]:
+                user_id = event["user_id"]
         text = event["button_data"] or event["button_id"] or event["button_label"]
         if not chat_id or not text:
             return
-        msg_id = f"interaction:{interaction_id}"
-        if self._is_seen(acct_id, msg_id):
-            return
-        ok = await self._deliver(
+        await self._deliver(
             acct_id=acct_id,
             chat_id=chat_id,
             chat_kind=chat_kind,
@@ -1229,8 +1246,6 @@ class QQIO:
             token=token,
             mentioned=True,
         )
-        if ok:
-            self._mark_seen(acct_id, msg_id)
 
     async def _load_runtime_state(self, acct_id):
         state = await self.conductor.db.get_local_account_runtime_state(
@@ -1338,7 +1353,7 @@ class QQIO:
                     return
                 await self._ensure_access_token(app_id=app_id, client_secret=client_secret)
                 gateway_url = await self._get_gateway_url(token=token, server=server)
-                ws_session = aiohttp.ClientSession(timeout=ws_timeout(), trust_env=True)
+                ws_session = client_session(timeout=ws_timeout(), trust_env=True, request_retry=False)
                 ws = await ws_session.ws_connect(
                     gateway_url,
                     headers={"User-Agent": "StationQQIO/1.0"},
@@ -1383,12 +1398,17 @@ class QQIO:
                             interval_ms = ext_int(d_data.get("heartbeat_interval"), "heartbeat_interval", default=30000)
                             heartbeat_interval["v"] = interval_ms / 1000.0 * 0.8
                             if sess.get("session_id") and sess.get("last_seq") is not None:
-                                await self._send_resume(
-                                    ws=ws,
-                                    token=token,
-                                    session_id=sess["session_id"],
-                                    last_seq=sess["last_seq"],
-                                )
+                                try:
+                                    await self._send_resume(
+                                        ws=ws,
+                                        token=token,
+                                        session_id=sess["session_id"],
+                                        last_seq=sess["last_seq"],
+                                    )
+                                except Exception:
+                                    sess["session_id"] = None
+                                    sess["last_seq"] = None
+                                    await self._send_identify(ws=ws, token=token, server=server)
                             else:
                                 await self._send_identify(ws=ws, token=token, server=server)
                         elif op == 0 and t:

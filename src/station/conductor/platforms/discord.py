@@ -1,8 +1,14 @@
 import asyncio
+import base64
 import io
 import json
+import mimetypes
 import os
+import shutil
+import subprocess
+import tempfile
 import time
+from urllib.parse import urlparse
 from typing import Any
 
 import aiohttp
@@ -13,11 +19,67 @@ from station.conductor.platforms.group_settings import discord_group_notice
 from station.conductor.platforms.keyboard import discord_components, parse_keyboard
 from station.conductor.util import apply_sender, attachment_type_from_meta, ext_bool, ext_id, ext_int, ext_str
 from station import logger
+from station.client.retry import RetryableError, is_retryable_error, is_transient_status, retry_transient
 from station.errors import ExternalError
 from station.prototypes.boundary import ext_dict, ext_list
 from station.timeouts import http_timeout, ws_timeout
 
 _THREAD_CHANNEL_TYPES = {10, 11, 12}
+
+
+def _transcode_discord_voice(data: bytes) -> bytes | None:
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg or not data:
+        return None
+    with tempfile.TemporaryDirectory() as directory:
+        src = os.path.join(directory, "audio.bin")
+        dst = os.path.join(directory, "voice.ogg")
+        with open(src, "wb") as handle:
+            handle.write(data)
+        try:
+            proc = subprocess.run(
+                [
+                    ffmpeg, "-y", "-i", src,
+                    "-ar", "48000", "-ac", "1", "-c:a", "libopus",
+                    "-b:a", "32k", "-vbr", "on", "-application", "voip",
+                    "-f", "ogg", dst,
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=30,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        if proc.returncode != 0 or not os.path.exists(dst):
+            return None
+        with open(dst, "rb") as handle:
+            out = handle.read()
+    if not out.startswith(b"OggS"):
+        return None
+    return out
+
+
+def _discord_cdn_host(url: str) -> bool:
+    host = (urlparse(url).hostname or "").lower()
+    return host.startswith("cdn.") or host.startswith("media.")
+
+
+def _ogg_opus_duration(data: bytes) -> float:
+    i = 0
+    last = 0
+    n = len(data)
+    while i + 27 <= n and data[i : i + 4] == b"OggS":
+        granule = int.from_bytes(data[i + 6 : i + 14], "little")
+        if granule > last:
+            last = granule
+        nseg = data[i + 26]
+        if i + 27 + nseg > n:
+            break
+        i += 27 + nseg + sum(data[i + 27 : i + 27 + nseg])
+    if last <= 0:
+        return 1.0
+    return last / 48000.0
 
 def _discord_user_sender(user):
     if user is None:
@@ -507,13 +569,27 @@ class DiscordIO:
             return 0, None
         url = f"{base}{path}"
         headers = {"Authorization": "Bot " + (token or "").strip()}
-        async with self.session.request(method.upper(), url, headers=headers, params=params, json=json_body) as resp:
-            status = int(resp.status)
-            try:
-                body = await resp.json(content_type=None)
-            except (aiohttp.ContentTypeError, json.JSONDecodeError, ValueError):
-                body = await resp.text()
-            return status, body
+
+        async def _once():
+            async with self.session.request(method.upper(), url, headers=headers, params=params, json=json_body) as resp:
+                status = int(resp.status)
+                try:
+                    body = await resp.json(content_type=None)
+                except (aiohttp.ContentTypeError, json.JSONDecodeError, ValueError) as e:
+                    if is_transient_status(status):
+                        raise RetryableError("discord body status=%s error=%s" % (status, e)) from e
+                    body = await resp.text()
+                if is_transient_status(status):
+                    raise RetryableError("discord status=%s path=%s" % (status, path))
+                return status, body
+
+        try:
+            return await retry_transient(_once, circuit_name="discord")
+        except Exception as e:
+            if not is_retryable_error(e):
+                raise
+            logger.error("discord request retry exhausted path=%s error=%s", path, e)
+            return 0, None
 
     def _dsb_attachments(self, atts: list[Any], stickers: list[Any] | None = None) -> tuple[list[dict], str]:
         out: list[dict] = []
@@ -708,17 +784,20 @@ class DiscordIO:
         filename: str | None = None,
         reply_to: str | None = None,
         keyboard=None,
+        voice: bool = False,
     ) -> bool:
         channel_id = send_channel_id(channel_id)
         api_base = self._api_base()
-        if file_bytes is not None:
-            try:
-                guidance.check_media_size("discord", len(file_bytes), "document")
-            except guidance.MediaTooLargeError:
-                return False
+        if file_bytes is not None and len(file_bytes) > 20 * 1024 * 1024:
+            return False
+        if voice and file_bytes is not None:
+            converted = _transcode_discord_voice(file_bytes)
+            if converted is None:
+                voice = False
+            else:
+                file_bytes = converted
+                filename = "voice-message.ogg"
         chunks = guidance.prepare_outbound_text("discord", (content or ""))
-        if len(chunks) > guidance.MAX_DISCORD_SPLIT_MESSAGES:
-            chunks = chunks[: guidance.MAX_DISCORD_SPLIT_MESSAGES]
         components = discord_components(keyboard) if parse_keyboard(keyboard) else None
         if file_bytes is None and not chunks and components is None:
             return False
@@ -736,11 +815,12 @@ class DiscordIO:
                 ok = await self._dsb_send_message(
                     token=token,
                     channel_id=channel_id,
-                    content=chunk,
+                    content="" if voice else chunk,
                     reply_to=use_reply,
                     file_bytes=use_file,
                     filename=use_name,
                     components=components if idx == 0 else None,
+                    voice=voice and idx == 0,
                 )
                 if not ok:
                     return False
@@ -778,7 +858,11 @@ class DiscordIO:
                     fail_if_not_exists=False,
                 )
             if idx == 0 and file_bytes is not None:
-                kwargs["file"] = discord.File(fp=io.BytesIO(file_bytes), filename=(filename or "file"))
+                send_name = "voice-message.ogg" if voice else (filename or "file")
+                kwargs["file"] = discord.File(fp=io.BytesIO(file_bytes), filename=send_name)
+                if voice:
+                    kwargs["content"] = ""
+                    kwargs["flags"] = discord.MessageFlags(voice=True)
             try:
                 await chan.send(**kwargs)
             except discord.HTTPException as e:
@@ -788,6 +872,28 @@ class DiscordIO:
                 else:
                     raise
         return True
+
+    async def _dsb_post(self, url, *, headers, json_body=None, form_fields=None):
+        async def _once():
+            data = None
+            if form_fields is not None:
+                data = aiohttp.FormData()
+                for name, value, options in form_fields:
+                    data.add_field(name, value, **options)
+            async with self.session.post(url, headers=headers, json=json_body, data=data) as resp:
+                status = int(resp.status)
+                err_body = await resp.text()
+                if is_transient_status(status):
+                    raise RetryableError("discord send status=%s" % status)
+                return status, err_body
+
+        try:
+            return await retry_transient(_once, circuit_name="discord")
+        except Exception as e:
+            if not is_retryable_error(e):
+                raise
+            logger.error("discord send retry exhausted error=%s", e)
+            return 0, str(e)
 
     async def _dsb_send_message(
         self,
@@ -799,6 +905,7 @@ class DiscordIO:
         file_bytes: bytes | None,
         filename: str | None,
         components=None,
+        voice: bool = False,
     ) -> bool:
         base = self._api_base()
         if not base:
@@ -812,66 +919,87 @@ class DiscordIO:
                 "allowed_mentions": allowed,
             }
             if reply_to:
-                payload["message_reference"] = {"message_id": reply_to.strip()}
+                payload["message_reference"] = {
+                    "message_id": reply_to.strip(),
+                    "channel_id": channel_id,
+                    "fail_if_not_exists": False,
+                }
             if components:
                 payload["components"] = components
-            async with self.session.post(url, headers=headers, json=payload) as resp:
-                status = int(resp.status)
-                err_body = await resp.text()
+            status, err_body = await self._dsb_post(url, headers=headers, json_body=payload)
             if 200 <= status < 300:
                 return True
             if reply_to and self._is_unknown_reply_error(status, err_body):
                 payload.pop("message_reference", None)
-                async with self.session.post(url, headers=headers, json=payload) as resp:
-                    return 200 <= int(resp.status) < 300
+                status, _err_body = await self._dsb_post(url, headers=headers, json_body=payload)
+                return 200 <= status < 300
             return False
         payload = {
             "content": (content or ""),
             "allowed_mentions": allowed,
         }
         if reply_to:
-            payload["message_reference"] = {"message_id": reply_to.strip()}
+            payload["message_reference"] = {
+                "message_id": reply_to.strip(),
+                "channel_id": channel_id,
+                "fail_if_not_exists": False,
+            }
         if components:
             payload["components"] = components
-        data = aiohttp.FormData()
-        data.add_field("payload_json", json.dumps(payload), content_type="application/json")
-        data.add_field("files[0]", file_bytes, filename=(filename or "file"), content_type="application/octet-stream")
-        async with self.session.post(url, headers=headers, data=data) as resp:
-            status = int(resp.status)
-            err_body = await resp.text()
+        send_name = filename or "file"
+        send_type = mimetypes.guess_type(send_name)[0] or "application/octet-stream"
+        if voice:
+            payload["content"] = ""
+            payload["flags"] = 8192
+            send_name = "voice-message.ogg"
+            send_type = "audio/ogg"
+            payload["attachments"] = [
+                {
+                    "id": 0,
+                    "filename": send_name,
+                    "duration_secs": round(_ogg_opus_duration(file_bytes), 2),
+                    "waveform": base64.b64encode(b"\x80" * 256).decode("ascii"),
+                }
+            ]
+
+        def _fields():
+            return (
+                ("payload_json", json.dumps(payload), {"content_type": "application/json"}),
+                ("files[0]", file_bytes, {"filename": send_name, "content_type": send_type}),
+            )
+
+        status, err_body = await self._dsb_post(url, headers=headers, form_fields=_fields())
         if 200 <= status < 300:
             return True
         if reply_to and self._is_unknown_reply_error(status, err_body):
             payload.pop("message_reference", None)
-            data = aiohttp.FormData()
-            data.add_field("payload_json", json.dumps(payload), content_type="application/json")
-            data.add_field("files[0]", file_bytes, filename=(filename or "file"), content_type="application/octet-stream")
-            async with self.session.post(url, headers=headers, data=data) as resp:
-                return 200 <= int(resp.status) < 300
+            status, _err_body = await self._dsb_post(url, headers=headers, form_fields=_fields())
+            return 200 <= status < 300
         return False
 
     @staticmethod
     def _is_unknown_reply_error(status: int, body: str) -> bool:
         raw = (body or "").lower()
-        if "10008" in raw or "unknown message" in raw or "system message" in raw:
+        if "10008" in raw or "unknown message" in raw:
             return True
-        return status == 400 and "message_reference" in raw
+        return "50035" in raw and "system message" in raw
 
     async def download(self, *, token: str, url: str) -> bytes | None:
         url = (url or "").strip()
         if not url:
             return None
         limit = guidance.max_media_bytes("discord", "document")
-        headers = {}
-        tok = (token or "").strip()
-        if tok:
-            if tok.startswith("Bot ") or tok.startswith("Bearer "):
-                headers["Authorization"] = tok
-            else:
-                headers["Authorization"] = "Bot " + tok
         max_redirects = 10
         current = url
         for _ in range(max_redirects + 1):
+            headers = {}
+            if not _discord_cdn_host(current):
+                tok = (token or "").strip()
+                if tok:
+                    if tok.startswith("Bot ") or tok.startswith("Bearer "):
+                        headers["Authorization"] = tok
+                    else:
+                        headers["Authorization"] = "Bot " + tok
             async with self.session.get(current, headers=headers, allow_redirects=False) as resp:
                 status = int(resp.status)
                 if status in (301, 302, 303, 307, 308):
@@ -1213,7 +1341,7 @@ class DiscordIO:
                             "d": {
                                 "token": token,
                                 "properties": {"os": "linux", "browser": "station", "device": "station"},
-                                "intents": 129 | 1024 | 8192,
+                                "intents": 1 | 128 | 512 | 1024 | 4096 | 8192 | 32768,
                             },
                         })
                     if interval > 0:
@@ -1776,40 +1904,33 @@ class DiscordIO:
                 for channel_id in channel_ids:
                     cursor = ext_str(cursors.get(channel_id), "cursor").strip()
                     msgs: list[Any] = []
-                    meta = channel_meta.get(channel_id) or {}
-                    is_thread = is_thread_channel_type(ext_int(meta.get("type"), "type")) or bool(ext_id(meta.get("parent_id"), "parent_id").strip())
                     if not cursor:
-                        if is_thread:
+                        status, seed_msgs = await self._dsb_request(
+                            method="GET",
+                            token=token,
+                            path=f"/api/v9/channels/{channel_id}/messages",
+                            params={"limit": "1"},
+                        )
+                        if status != 200 or not isinstance(seed_msgs, list):
+                            continue
+                        if not seed_msgs:
                             cursors[channel_id] = "0"
-                            cursor = "0"
                             state_dirty = True
+                            continue
+                        seed = seed_msgs[0]
+                        seed = ext_dict('discord seed message', seed)
+                        seed_id = ext_id(seed.get("id"), "id").strip()
+                        if not seed_id:
+                            continue
+                        author = seed.get("author")
+                        is_bot = isinstance(author, dict) and bool(author.get("bot"))
+                        content = ext_str(seed.get("content"), "content").strip()
+                        if (not is_bot) and content.startswith("/start"):
+                            msgs = [seed]
                         else:
-                            status, seed_msgs = await self._dsb_request(
-                                method="GET",
-                                token=token,
-                                path=f"/api/v9/channels/{channel_id}/messages",
-                                params={"limit": "1"},
-                            )
-                            if status != 200 or not isinstance(seed_msgs, list):
-                                continue
-                            if not seed_msgs:
-                                cursors[channel_id] = "0"
-                                state_dirty = True
-                                continue
-                            seed = seed_msgs[0]
-                            seed = ext_dict('discord seed message', seed)
-                            seed_id = ext_id(seed.get("id"), "id").strip()
-                            if not seed_id:
-                                continue
-                            author = seed.get("author")
-                            is_bot = isinstance(author, dict) and bool(author.get("bot"))
-                            content = ext_str(seed.get("content"), "content").strip()
-                            if (not is_bot) and content.startswith("/start"):
-                                msgs = [seed]
-                            else:
-                                cursors[channel_id] = seed_id
-                                state_dirty = True
-                                continue
+                            cursors[channel_id] = seed_id
+                            state_dirty = True
+                            continue
                     if cursor and not msgs:
                         status, fetched = await self._dsb_request(
                             method="GET",

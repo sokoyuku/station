@@ -6,11 +6,78 @@ from station.prototypes.model_config import PrototypeModelConfig, load_overlay
 from station.prototypes.prototype import Prototype
 from station.prototypes.speech import PrototypeSpeech
 from station.prototypes.workspace import PrototypeWorkspace
+from station.timeouts import LONG_IO_TIMEOUT_S, wait
 
 from .attachments import CursorAttachments
-from .client import start_cursor_gateway
+from .client import list_cursor_models, start_cursor_gateway
 from .config import CursorLaunchSettings
 from .worker import CursorWorker
+
+# Telegram callback_data is 64 bytes. "/model " plus the id must fit so a tap
+# still reaches the existing /model handler intact.
+_MODEL_CALLBACK_MAX = 64
+_MODEL_BUTTONS_PER_PAGE = 10
+_MODEL_BUTTONS_PER_ROW = 2
+_MODEL_LIST_ERRORS = (OSError, RuntimeError, TimeoutError, TypeError, ValueError)
+
+
+def _model_list_errors():
+    try:
+        from cursor_sdk import CursorAgentError
+    except ImportError:
+        return _MODEL_LIST_ERRORS
+    return _MODEL_LIST_ERRORS + (CursorAgentError,)
+
+
+def cursor_model_pages(models, *, current):
+    buttons = []
+    too_long = []
+    seen = set()
+    for model in models:
+        model_id = (getattr(model, "id", "") or "").strip()
+        if not model_id or model_id in seen:
+            continue
+        seen.add(model_id)
+        callback = "/model %s" % model_id
+        if len(callback.encode("utf-8")) > _MODEL_CALLBACK_MAX:
+            too_long.append(model_id)
+            continue
+        label = (getattr(model, "display_name", "") or "").strip() or model_id
+        if model_id == current:
+            label = "%s · current" % label
+        buttons.append({"text": label, "id": callback})
+    pages = []
+    for start in range(0, len(buttons), _MODEL_BUTTONS_PER_PAGE):
+        chunk = buttons[start:start + _MODEL_BUTTONS_PER_PAGE]
+        rows = []
+        row = []
+        for button in chunk:
+            row.append(button)
+            if len(row) == _MODEL_BUTTONS_PER_ROW:
+                rows.append(row)
+                row = []
+        if row:
+            rows.append(row)
+        pages.append(rows)
+    return pages, too_long
+
+
+def cursor_model_list_text(*, current, page, page_count, too_long, last_page):
+    lines = ["Current model: %s" % (current or "(not set)")]
+    if page_count == 0 and not too_long:
+        lines.append("No Cursor models are available for this API key.")
+        lines.append("Set one with /model <name>.")
+        return "\n".join(lines)
+    if page_count == 0:
+        lines.append("These models do not fit on a button.")
+    elif page_count == 1:
+        lines.append("Tap a model to set it.")
+    else:
+        lines.append("Tap a model to set it (%s/%s)." % (page, page_count))
+    if last_page and too_long:
+        lines.append("Too long for a button: %s" % ", ".join(too_long))
+        lines.append("Set those with /model <name>.")
+    return "\n".join(lines)
 
 
 class CursorPrototype(PrototypeModelConfig, PrototypeWorkspace, CursorWorker, CursorAttachments, PrototypeSpeech, PrototypeGateway, Prototype):
@@ -85,9 +152,107 @@ class CursorPrototype(PrototypeModelConfig, PrototypeWorkspace, CursorWorker, Cu
 
     def _kind_help_commands(self):
         return [
+            ("/models", "List models"),
             ("/workspace", "Show or set workspace"),
             ("/cwd", "Show or set workspace"),
         ]
+
+    async def _handle_model_config_command(
+        self,
+        *,
+        cmd,
+        args,
+        chat_id,
+        acct_id,
+        reply_to,
+        model_settings,
+        platform="",
+        chat_type="",
+    ):
+        if cmd == "/models" or (cmd == "/model" and not (args or "").strip()):
+            await self._send_model_list(
+                chat_id=chat_id,
+                acct_id=acct_id,
+                reply_to=reply_to,
+                platform=platform,
+                chat_type=chat_type,
+            )
+            return True
+        return await super()._handle_model_config_command(
+            cmd=cmd,
+            args=args,
+            chat_id=chat_id,
+            acct_id=acct_id,
+            reply_to=reply_to,
+            model_settings=model_settings,
+            platform=platform,
+            chat_type=chat_type,
+        )
+
+    async def _send_model_list(self, *, chat_id, acct_id, reply_to, platform, chat_type):
+        settings = self._build_settings()
+        if not settings.api_key:
+            await self.send_outbound(
+                text=self._secret_prompt(),
+                chat_id=chat_id,
+                acct_id=acct_id,
+                reply_to=reply_to,
+                platform=platform,
+                chat_type=chat_type,
+            )
+            return
+        try:
+            gateway = await self._ensure_gateway()
+            models = await wait(
+                list_cursor_models(gateway=gateway, api_key=settings.api_key),
+                LONG_IO_TIMEOUT_S,
+                "cursor list models",
+            )
+        except _model_list_errors() as e:
+            logger.error("Cursor list models failed model_id=%s error=%s", self.model_id, e)
+            await self.send_outbound(
+                text="Cursor models could not be listed: %s" % e,
+                chat_id=chat_id,
+                acct_id=acct_id,
+                reply_to=reply_to,
+                platform=platform,
+                chat_type=chat_type,
+            )
+            return
+        pages, too_long = cursor_model_pages(models, current=settings.model)
+        page_count = len(pages)
+        if page_count == 0:
+            await self.send_outbound(
+                text=cursor_model_list_text(
+                    current=settings.model,
+                    page=0,
+                    page_count=0,
+                    too_long=too_long,
+                    last_page=True,
+                ),
+                chat_id=chat_id,
+                acct_id=acct_id,
+                reply_to=reply_to,
+                platform=platform,
+                chat_type=chat_type,
+            )
+            return
+        for index, rows in enumerate(pages, start=1):
+            await self.send_outbound(
+                text=cursor_model_list_text(
+                    current=settings.model,
+                    page=index,
+                    page_count=page_count,
+                    too_long=too_long,
+                    last_page=index == page_count,
+                ),
+                chat_id=chat_id,
+                acct_id=acct_id,
+                reply_to=reply_to,
+                platform=platform,
+                chat_type=chat_type,
+                keyboard=rows,
+            )
 
     async def _handle_kind_command(self, *, cmd, args, chat_id, acct_id, reply_to, model_settings, platform="", chat_type=""):
         if cmd == "/start":

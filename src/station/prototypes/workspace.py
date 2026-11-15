@@ -10,9 +10,16 @@ def is_windows_interop_path(path):
     normalized = path.replace("\\", "/").lower()
     if normalized.endswith(".exe"):
         return True
-    if normalized.startswith("/mnt/c/"):
-        return True
     if "/nvm4w/" in normalized:
+        return True
+    # WSL mounts of Windows drives (/mnt/c, /mnt/d, ...). A symlink on /mnt/c
+    # often realpaths onto another drive, so checking only /mnt/c is not enough.
+    if (
+        normalized.startswith("/mnt/")
+        and len(normalized) > 6
+        and normalized[5].isalpha()
+        and normalized[6] == "/"
+    ):
         return True
     return False
 

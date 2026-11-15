@@ -1,7 +1,7 @@
 import asyncio
 import json
 
-from station.conductor.util import node_bin, whatsapp_bridge_dir
+from station.conductor.util import node_bin, whatsapp_bridge_dir, whatsapp_process_env
 from station import logger
 from station.errors import ExternalError
 from station.prototypes.boundary import ext_dict, ext_str
@@ -44,6 +44,9 @@ class WhatsAppPairer:
         if not pair_js.is_file():
             await on_failed(f"whatsapp bridge missing: {pair_js}", status="failed")
             return WhatsAppPairHandle(None)
+        if not (bridge_dir / "node_modules" / "@whiskeysockets" / "baileys").is_dir():
+            await on_failed(f"whatsapp bridge dependencies missing: {bridge_dir}", status="failed")
+            return WhatsAppPairHandle(None)
         cmd = [
             node_bin(),
             str(pair_js),
@@ -57,6 +60,7 @@ class WhatsAppPairer:
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             cwd=str(bridge_dir),
+            env=whatsapp_process_env(self.lc.config),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )

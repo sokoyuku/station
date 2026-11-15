@@ -9,6 +9,7 @@ from urllib.parse import urlparse
 import aiohttp
 
 from station import logger
+from station.client.retry import client_connector, client_session
 from station.errors import ExternalError
 from station.prototypes.boundary import ext_dict, ext_float, ext_list, ext_str
 from station.prototypes.chat_history import prefix_content
@@ -116,10 +117,11 @@ async def _open_session(session, timeout, *, url=""):
     trust_env = True if not url else _trust_env_for_url(url)
     if session is not None and not session.closed and trust_env:
         return session, False
-    active = aiohttp.ClientSession(
+    active = client_session(
         timeout=timeout,
         trust_env=trust_env,
-        connector=aiohttp.TCPConnector(ssl=True, force_close=True, limit=8),
+        request_retry=False,
+        connector=client_connector(ssl=True, force_close=True, limit=8),
     )
     return active, True
 

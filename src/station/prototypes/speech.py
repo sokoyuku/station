@@ -5,6 +5,7 @@ import os
 import aiohttp
 
 from station import logger
+from station.client.retry import RetryableError, client_session, is_transient_status, retry_transient
 from station.errors import ExternalError
 from station.prototypes.boundary import ext_dict, ext_mapping_get, ext_str
 from station.prototypes.launch_settings import normalize_openai_base_url
@@ -107,7 +108,7 @@ async def transcribe_file(settings, local_path, *, filename=""):
     name = filename or os.path.basename(local_path) or "audio.wav"
     timeout = aiohttp.ClientTimeout(total=180, connect=20, sock_connect=20, sock_read=150)
     try:
-        async with aiohttp.ClientSession(timeout=timeout, trust_env=True) as session:
+        async with client_session(timeout=timeout, trust_env=True) as session:
             if settings.kind == "ds":
                 return await _transcribe_ds(session, settings, audio_bytes, name)
             if settings.kind == "xai":
@@ -126,7 +127,7 @@ async def synthesize_text(settings, text):
         return b"", ""
     timeout = aiohttp.ClientTimeout(total=120, connect=20, sock_connect=20, sock_read=90)
     try:
-        async with aiohttp.ClientSession(timeout=timeout, trust_env=True) as session:
+        async with client_session(timeout=timeout, trust_env=True) as session:
             if settings.kind == "ds":
                 return await _synthesize_ds(session, settings, prompt)
             if settings.kind == "xai":
@@ -139,53 +140,79 @@ async def synthesize_text(settings, text):
         raise ExternalError("speech TTS failed kind=%s error=%s" % (settings.kind, e)) from e
 
 
+async def _exchange(session, url, *, headers, params=None, json_body=None, fields=None):
+    async def _once():
+        data = None
+        if fields is not None:
+            data = aiohttp.FormData()
+            for name, value, options in fields:
+                data.add_field(name, value, **options)
+        async with session.post(url, headers=headers, params=params, json=json_body, data=data) as resp:
+            raw = await resp.read()
+            if is_transient_status(resp.status):
+                raise RetryableError("speech status=%s" % resp.status)
+            content_type = (resp.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+            return int(resp.status), raw, content_type
+
+    return await retry_transient(_once, circuit_name="speech")
+
+
 async def _transcribe_openai(session, settings, audio_bytes, filename):
     url = "%s/audio/transcriptions" % settings.base_url.rstrip("/")
-    form = aiohttp.FormData()
-    form.add_field("file", audio_bytes, filename=filename, content_type="application/octet-stream")
-    form.add_field("model", settings.stt_model or "whisper-1")
     headers = _auth_headers(settings.api_key, content_type=None)
-    async with session.post(url, headers=headers, data=form) as resp:
-        raw = await resp.read()
-        if resp.status >= 400:
-            logger.error("speech STT openai failed status=%s body=%r", resp.status, raw[:400])
-            raise ExternalError("speech STT openai failed status=%s" % resp.status)
-        data = json.loads(raw.decode("utf-8"))
-        data = ext_dict("stt response", data)
-        return ext_str("stt text", data.get("text"), strip=False).strip()
+    status, raw, _content_type = await _exchange(
+        session,
+        url,
+        headers=headers,
+        fields=(
+            ("file", audio_bytes, {"filename": filename, "content_type": "application/octet-stream"}),
+            ("model", settings.stt_model or "whisper-1", {}),
+        ),
+    )
+    if status >= 400:
+        logger.error("speech STT openai failed status=%s body=%r", status, raw[:400])
+        raise ExternalError("speech STT openai failed status=%s" % status)
+    data = json.loads(raw.decode("utf-8"))
+    data = ext_dict("stt response", data)
+    return ext_str("stt text", data.get("text"), strip=False).strip()
 
 
 async def _transcribe_xai(session, settings, audio_bytes, filename):
     url = "%s/stt" % settings.base_url.rstrip("/")
-    form = aiohttp.FormData()
-    form.add_field("file", audio_bytes, filename=filename, content_type="application/octet-stream")
     headers = _auth_headers(settings.api_key, content_type=None)
-    async with session.post(url, headers=headers, data=form) as resp:
-        raw = await resp.read()
-        if resp.status >= 400:
-            logger.error("speech STT xai failed status=%s body=%r", resp.status, raw[:400])
-            raise ExternalError("speech STT xai failed status=%s" % resp.status)
-        data = json.loads(raw.decode("utf-8"))
-        data = ext_dict("stt response", data)
-        return ext_str("stt text", data.get("text"), strip=False).strip()
+    status, raw, _content_type = await _exchange(
+        session,
+        url,
+        headers=headers,
+        fields=(("file", audio_bytes, {"filename": filename, "content_type": "application/octet-stream"}),),
+    )
+    if status >= 400:
+        logger.error("speech STT xai failed status=%s body=%r", status, raw[:400])
+        raise ExternalError("speech STT xai failed status=%s" % status)
+    data = json.loads(raw.decode("utf-8"))
+    data = ext_dict("stt response", data)
+    return ext_str("stt text", data.get("text"), strip=False).strip()
 
 
 async def _transcribe_ds(session, settings, audio_bytes, filename):
     url = "%s/v1/asr/transcribe" % settings.base_url.rstrip("/")
-    form = aiohttp.FormData()
-    form.add_field("audio", audio_bytes, filename=filename)
     headers = _auth_headers(settings.api_key, content_type=None)
     params = {}
     if settings.stt_model:
         params["model"] = settings.stt_model
-    async with session.post(url, headers=headers, params=params, data=form) as resp:
-        raw = await resp.read()
-        if resp.status >= 400:
-            logger.error("speech STT ds failed status=%s body=%r", resp.status, raw[:400])
-            raise ExternalError("speech STT ds failed status=%s" % resp.status)
-        data = json.loads(raw.decode("utf-8"))
-        data = ext_dict("stt response", data)
-        return ext_str("stt text", data.get("text") or data.get("transcript"), strip=False).strip()
+    status, raw, _content_type = await _exchange(
+        session,
+        url,
+        headers=headers,
+        params=params,
+        fields=(("audio", audio_bytes, {"filename": filename}),),
+    )
+    if status >= 400:
+        logger.error("speech STT ds failed status=%s body=%r", status, raw[:400])
+        raise ExternalError("speech STT ds failed status=%s" % status)
+    data = json.loads(raw.decode("utf-8"))
+    data = ext_dict("stt response", data)
+    return ext_str("stt text", data.get("text") or data.get("transcript"), strip=False).strip()
 
 
 async def _synthesize_openai(session, settings, text):
@@ -196,15 +223,13 @@ async def _synthesize_openai(session, settings, text):
         "voice": settings.tts_voice or "alloy",
     }
     headers = _auth_headers(settings.api_key)
-    async with session.post(url, headers=headers, json=payload) as resp:
-        raw = await resp.read()
-        if resp.status >= 400:
-            logger.error("speech TTS openai failed status=%s body=%r", resp.status, raw[:400])
-            raise ExternalError("speech TTS openai failed status=%s" % resp.status)
-        content_type = (resp.headers.get("Content-Type") or "").split(";")[0].strip().lower()
-        if not raw:
-            raise ExternalError("speech TTS openai returned no audio")
-        return raw, content_type or "audio/mpeg"
+    status, raw, content_type = await _exchange(session, url, headers=headers, json_body=payload)
+    if status >= 400:
+        logger.error("speech TTS openai failed status=%s body=%r", status, raw[:400])
+        raise ExternalError("speech TTS openai failed status=%s" % status)
+    if not raw:
+        raise ExternalError("speech TTS openai returned no audio")
+    return raw, content_type or "audio/mpeg"
 
 
 async def _synthesize_xai(session, settings, text):
@@ -216,25 +241,23 @@ async def _synthesize_xai(session, settings, text):
         "output_format": {"codec": "mp3", "sample_rate": 24000},
     }
     headers = _auth_headers(settings.api_key)
-    async with session.post(url, headers=headers, json=payload) as resp:
-        raw = await resp.read()
-        content_type = (resp.headers.get("Content-Type") or "").split(";")[0].strip().lower()
-        if resp.status >= 400:
-            logger.error("speech TTS xai failed status=%s body=%r", resp.status, raw[:400])
-            raise ExternalError("speech TTS xai failed status=%s" % resp.status)
-        if "application/json" in content_type:
-            data = json.loads(raw.decode("utf-8"))
-            data = ext_dict("tts response", data)
-            audio_b64 = ext_str("tts audio", data.get("audio"), strip=False)
-            if not audio_b64:
-                raise ExternalError("speech TTS xai returned no audio")
-            import base64
-
-            mime = ext_str("tts content_type", data.get("content_type"), strip=False) or "audio/mpeg"
-            return base64.b64decode(audio_b64), mime
-        if not raw:
+    status, raw, content_type = await _exchange(session, url, headers=headers, json_body=payload)
+    if status >= 400:
+        logger.error("speech TTS xai failed status=%s body=%r", status, raw[:400])
+        raise ExternalError("speech TTS xai failed status=%s" % status)
+    if "application/json" in content_type:
+        data = json.loads(raw.decode("utf-8"))
+        data = ext_dict("tts response", data)
+        audio_b64 = ext_str("tts audio", data.get("audio"), strip=False)
+        if not audio_b64:
             raise ExternalError("speech TTS xai returned no audio")
-        return raw, content_type or "audio/mpeg"
+        import base64
+
+        mime = ext_str("tts content_type", data.get("content_type"), strip=False) or "audio/mpeg"
+        return base64.b64decode(audio_b64), mime
+    if not raw:
+        raise ExternalError("speech TTS xai returned no audio")
+    return raw, content_type or "audio/mpeg"
 
 
 async def _synthesize_ds(session, settings, text):
@@ -245,15 +268,19 @@ async def _synthesize_ds(session, settings, text):
     if settings.tts_voice:
         body["voice"] = settings.tts_voice
     headers = _auth_headers(settings.api_key)
-    async with session.post(url, headers=headers, json=body, params={"format": "wav"}) as resp:
-        raw = await resp.read()
-        if resp.status >= 400:
-            logger.error("speech TTS ds failed status=%s body=%r", resp.status, raw[:400])
-            raise ExternalError("speech TTS ds failed status=%s" % resp.status)
-        content_type = (resp.headers.get("Content-Type") or "").split(";")[0].strip().lower()
-        if not raw:
-            raise ExternalError("speech TTS ds returned no audio")
-        return raw, content_type or "audio/wav"
+    status, raw, content_type = await _exchange(
+        session,
+        url,
+        headers=headers,
+        params={"format": "wav"},
+        json_body=body,
+    )
+    if status >= 400:
+        logger.error("speech TTS ds failed status=%s body=%r", status, raw[:400])
+        raise ExternalError("speech TTS ds failed status=%s" % status)
+    if not raw:
+        raise ExternalError("speech TTS ds returned no audio")
+    return raw, content_type or "audio/wav"
 
 
 class PrototypeSpeech(PrototypeVoice):

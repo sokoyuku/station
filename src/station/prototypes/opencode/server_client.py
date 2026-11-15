@@ -9,6 +9,7 @@ from urllib.parse import quote
 import aiohttp
 
 from station import logger
+from station.client.retry import client_session
 from station.timeouts import TURN_TIMEOUT_S, http_timeout, read_line, ws_timeout
 from station.errors import ExternalError
 from station.prototypes.boundary import ext_dict, ext_list, ext_str
@@ -129,7 +130,7 @@ class OpenCodeServerProcess:
         if self.proc.returncode is not None:
             raise RuntimeError("OpenCode serve exited early with code %s" % self.proc.returncode)
         self._ready.set()
-        self._session = aiohttp.ClientSession(
+        self._session = client_session(
             auth=self._basic_auth(),
             timeout=ws_timeout(sock_read=TURN_TIMEOUT_S),
         )
@@ -495,7 +496,7 @@ class OpenCodeServerProcess:
                     "OpenCode serve exited early with code %s: %s" % (self.proc.returncode, last_error)
                 )
             try:
-                async with aiohttp.ClientSession(auth=self._basic_auth(), timeout=http_timeout(total=10)) as session:
+                async with client_session(auth=self._basic_auth(), timeout=http_timeout(total=10)) as session:
                     async with session.get("%s/api/info" % self.base_url, timeout=http_timeout(total=10)) as resp:
                         text = await resp.text()
                         if resp.status == 401 and self._announced_password:

@@ -1,7 +1,6 @@
 import json
 import os
 import shlex
-import shutil
 from dataclasses import dataclass
 
 from station.prototypes.boundary import ext_dict, ext_mapping_get
@@ -12,7 +11,6 @@ from station.prototypes.launch_settings import (
     launch_sections,
     merge_launch_settings,
     parse_command_args,
-    first_existing_command,
     resolve_local_llm,
     split_provider_model,
     uses_xai as provider_uses_xai,
@@ -20,21 +18,26 @@ from station.prototypes.launch_settings import (
 )
 from station.prototypes.workspace import is_windows_interop_path
 
-def _linux_opencode_candidates():
-    home = os.path.expanduser("~")
-    return [
-        os.path.join(home, ".local", "bin", "opencode"),
-        os.path.join(home, ".local", "share", "opencode-linux", "opencode"),
-        os.path.join(home, ".opencode", "bin", "opencode"),
-    ]
+def _linux_opencode_paths():
+    return (
+        "/usr/local/bin/opencode",
+        os.path.join(os.path.expanduser("~"), ".local", "bin", "opencode"),
+    )
 
 def _usable_linux_opencode(path):
-    if not os.path.exists(path):
+    if not path or not os.path.isabs(path) or is_windows_interop_path(path) or not os.path.exists(path):
         return ""
     resolved = os.path.realpath(path)
+    if is_windows_interop_path(resolved):
+        return ""
     if not os.path.isfile(resolved) or not os.access(resolved, os.X_OK):
         return ""
-    if is_windows_interop_path(resolved):
+    try:
+        with open(resolved, "rb") as handle:
+            magic = handle.read(4)
+    except OSError:
+        return ""
+    if magic != b"\x7fELF":
         return ""
     return resolved
 
@@ -48,32 +51,21 @@ def _resolve_opencode_command(server):
         explicit = parse_command_args(raw, "server.command")
 
     if explicit:
-        if is_windows_interop_path(explicit[0]):
+        usable = _usable_linux_opencode(explicit[0])
+        if not usable:
             raise RuntimeError(
-                "server.command points at a Windows/interop binary; "
-                "install a Linux OpenCode binary for WSL (e.g. ~/.local/bin/opencode)"
+                "server.command must be an absolute path to the Linux OpenCode ELF at "
+                "/usr/local/bin/opencode or ~/.local/bin/opencode"
             )
-        return explicit
+        return [usable, *explicit[1:]]
 
-    found = first_existing_command([[path] for path in _linux_opencode_candidates() if _usable_linux_opencode(path)])
-    if found:
-        return found
-
-    installed = shutil.which("opencode")
-    if installed:
-        usable = _usable_linux_opencode(installed)
+    for path in _linux_opencode_paths():
+        usable = _usable_linux_opencode(path)
         if usable:
             return [usable]
-        if is_windows_interop_path(installed):
-            raise RuntimeError(
-                "PATH opencode is a Windows/interop binary; "
-                "install a Linux OpenCode binary for WSL (e.g. ~/.local/bin/opencode)"
-            )
 
     raise RuntimeError(
-        "Linux OpenCode binary not found. Install with: "
-        "curl -fsSL https://opencode.ai/install | bash "
-        "or place a Linux binary at ~/.local/bin/opencode"
+        "Linux OpenCode ELF not found at /usr/local/bin/opencode or ~/.local/bin/opencode"
     )
 
 OPENCODE_LOCAL_PROVIDER = "local-llm"

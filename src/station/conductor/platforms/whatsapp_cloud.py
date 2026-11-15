@@ -11,6 +11,7 @@ from collections import OrderedDict
 import aiohttp
 from aiohttp import web
 
+from station.client.retry import RetryableError, client_session, is_retryable_error, is_transient_status, retry_transient
 from station.conductor.crypto import decrypt_if_encrypted
 from station.conductor.platforms.base import LocalPlatformAdapter
 from station.conductor.platforms import guidance
@@ -116,7 +117,7 @@ class WhatsAppCloudIO:
         if self._api_session is not None and not self._api_session.closed:
             return
         timeout = aiohttp.ClientTimeout(total=120)
-        self._api_session = aiohttp.ClientSession(timeout=timeout, trust_env=True)
+        self._api_session = client_session(timeout=timeout, trust_env=True)
 
     @property
     def session(self):
@@ -215,13 +216,24 @@ class WhatsAppCloudIO:
             "Authorization": f"Bearer {creds['access_token']}",
             "Content-Type": "application/json",
         }
-        async with self.session.post(url, headers=headers, json=payload) as resp:
-            try:
-                body = await resp.json(content_type=None)
-            except (aiohttp.ContentTypeError, json.JSONDecodeError, ValueError):
-                raw = await resp.text()
-                body = {"raw": (raw or "")[:500]}
-            return resp.status, body
+
+        async def _once():
+            async with self.session.post(url, headers=headers, json=payload) as resp:
+                try:
+                    body = await resp.json(content_type=None)
+                except (aiohttp.ContentTypeError, json.JSONDecodeError, ValueError) as e:
+                    raise RetryableError("whatsapp_cloud body status=%s error=%s" % (resp.status, e)) from e
+                if is_transient_status(resp.status):
+                    raise RetryableError("whatsapp_cloud status=%s" % resp.status)
+                return resp.status, body
+
+        try:
+            return await retry_transient(_once, circuit_name="whatsapp_cloud")
+        except Exception as e:
+            if not is_retryable_error(e):
+                raise
+            logger.error("whatsapp_cloud send retry exhausted error=%s", e)
+            return 0, {"error": str(e)}
 
     async def send_typing(self, *, acct, token, chat_id):
         creds = self._creds_for_acct(acct, token)
@@ -306,6 +318,10 @@ class WhatsAppCloudIO:
                 "-y",
                 "-i",
                 src_path,
+                "-ar",
+                "48000",
+                "-ac",
+                "1",
                 "-c:a",
                 "libopus",
                 "-b:a",
@@ -314,6 +330,8 @@ class WhatsAppCloudIO:
                 "on",
                 "-application",
                 "voip",
+                "-f",
+                "ogg",
                 out_path,
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.DEVNULL,
@@ -333,20 +351,34 @@ class WhatsAppCloudIO:
             path="media",
         )
         filename = (filename or "").strip() or f"file{ext_for_mime(mime_type) or ''}"
-        form = aiohttp.FormData()
-        form.add_field("messaging_product", "whatsapp")
-        form.add_field("type", mime_type)
-        form.add_field(
-            "file",
-            file_bytes,
-            filename=filename,
-            content_type=mime_type,
-        )
         headers = {"Authorization": f"Bearer {creds['access_token']}"}
-        async with self.session.post(url, headers=headers, data=form) as resp:
-            if resp.status != 200:
-                return None
-            body = await resp.json(content_type=None)
+
+        async def _once():
+            upload = aiohttp.FormData()
+            upload.add_field("messaging_product", "whatsapp")
+            upload.add_field("type", mime_type)
+            upload.add_field(
+                "file",
+                file_bytes,
+                filename=filename,
+                content_type=mime_type,
+            )
+            async with self.session.post(url, headers=headers, data=upload) as resp:
+                if is_transient_status(resp.status):
+                    raise RetryableError("whatsapp_cloud media status=%s" % resp.status)
+                if resp.status != 200:
+                    return None
+                return await resp.json(content_type=None)
+
+        try:
+            body = await retry_transient(_once, circuit_name="whatsapp_cloud")
+        except Exception as e:
+            if not is_retryable_error(e):
+                raise
+            logger.error("whatsapp_cloud media retry exhausted error=%s", e)
+            return None
+        if body is None:
+            return None
         try:
             body = ext_dict("whatsapp_cloud media body", body)
         except ExternalError:
@@ -393,11 +425,12 @@ class WhatsAppCloudIO:
         ).strip()
 
         send_bytes = file_bytes
+        voice_note = False
         if method == "send_voice" and send_bytes is not None:
             src_path = None
             opus_path = None
             try:
-                with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp:
+                with tempfile.NamedTemporaryFile(suffix=".bin", delete=False) as tmp:
                     tmp.write(send_bytes)
                     src_path = tmp.name
                 opus_path = await self._convert_to_opus(src_path)
@@ -406,13 +439,18 @@ class WhatsAppCloudIO:
                         send_bytes = fh.read()
                     mime = "audio/ogg; codecs=opus"
                     filename = (filename.rsplit(".", 1)[0] if filename else "voice") + ".ogg"
+                    voice_note = True
+                else:
+                    media_type = "document"
+                    mime = "application/octet-stream"
             finally:
                 for path in (src_path, opus_path):
-                    if path:
-                        try:
-                            os.unlink(path)
-                        except OSError as e:
-                            logger.error("unexpected where=whatsapp_cloud_unlink path=%s error=%s", path, e, exc_info=e)
+                    if not path:
+                        continue
+                    try:
+                        os.unlink(path)
+                    except OSError as e:
+                        logger.error("unexpected where=whatsapp_cloud_unlink path=%s error=%s", path, e, exc_info=e)
 
         if send_bytes is not None:
             if len(send_bytes) > limit:
@@ -446,9 +484,13 @@ class WhatsAppCloudIO:
         else:
             media_obj["link"] = media_link
         if caption and media_type in ("image", "video", "document"):
-            media_obj["caption"] = guidance.prepare_outbound_caption("whatsapp_cloud", caption)
+            media_obj["caption"] = guidance.truncate_to_limit(
+                caption, guidance.max_caption_length("whatsapp_cloud"), None
+            )
         if media_type == "document" and filename:
             media_obj["filename"] = filename
+        if voice_note:
+            media_obj["voice"] = True
         body = {
             "messaging_product": "whatsapp",
             "recipient_type": "individual",
@@ -511,13 +553,13 @@ class WhatsAppCloudIO:
             if msg_type == "button":
                 button_obj = raw_message.get("button")
                 button_obj = ext_dict('whatsapp_cloud button', button_obj)
-                text = ext_str(button_obj.get("payload"), "payload").strip() or ext_str(button_obj.get("text"), "text").strip()
+                text = ext_str(button_obj.get("text"), "text").strip() or ext_str(button_obj.get("payload"), "payload").strip()
             else:
                 inter = raw_message.get("interactive")
                 inter = ext_dict('whatsapp_cloud interactive', inter)
                 inner = inter.get("button_reply") or inter.get("list_reply")
                 inner = ext_dict('whatsapp_cloud interactive reply', inner)
-                text = ext_str(inner.get("id"), "id").strip() or ext_str(inner.get("title"), "title").strip()
+                text = ext_str(inner.get("title"), "title").strip() or ext_str(inner.get("id"), "id").strip()
         elif msg_type in ("image", "video", "audio", "voice", "document", "sticker"):
             inner = raw_message.get(msg_type)
             inner = ext_dict('inner', inner)
@@ -737,6 +779,8 @@ class WhatsAppCloudIO:
                     parsed = self.parse_cloud_message(raw_message, contacts_by_waid, bot_ids=bot_ids)
                     if not parsed:
                         continue
+                    if wamid:
+                        self._mark_wamid_seen(wamid)
                     remember_id = wamid if wamid else ext_id(parsed.get("msg_id"), "msg_id")
                     if remember_id.startswith("reaction:"):
                         remember_id = wamid
@@ -789,9 +833,7 @@ class WhatsAppCloudIO:
                         request_id=parsed["msg_id"] or None,
                         body=body,
                     )
-                    if ok:
-                        self._mark_wamid_seen(wamid)
-                    else:
+                    if not ok:
                         delivery_failed = True
         return not delivery_failed
 
@@ -893,9 +935,7 @@ class WhatsAppCloudAdapter(LocalPlatformAdapter):
         except json.JSONDecodeError:
             raise ExternalError("Invalid JSON body")
         payload = ext_dict("payload", payload)
-        ok = await self.io.process_payload(acct_id=acct_id, payload=payload)
-        if not ok:
-            return web.Response(status=500, text="delivery failed")
+        await self.io.process_payload(acct_id=acct_id, payload=payload)
         return web.Response(status=200)
 
     def register_routes(self, app):

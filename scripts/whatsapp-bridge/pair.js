@@ -5,6 +5,7 @@ import pino from 'pino';
 import path from 'path';
 import { mkdirSync } from 'fs';
 import { resolveWhatsAppVersion } from './version.js';
+import { baileysSocketConfig, WHATSAPP_DEVICE } from './wab-socket.js';
 
 const args = process.argv.slice(2);
 function getArg(name, defaultVal) {
@@ -28,16 +29,16 @@ async function start(attempt = 0) {
   let done = false;
   const version = await resolveWhatsAppVersion();
 
-  const sock = makeWASocket({
+  const sock = makeWASocket(await baileysSocketConfig({
     version,
     auth: state,
     logger,
     printQRInTerminal: false,
-    browser: ['Sokoyuku Local', 'Chrome', '120.0'],
+    browser: WHATSAPP_DEVICE,
     syncFullHistory: false,
     markOnlineOnConnect: false,
     getMessage: async () => ({ conversation: '' }),
-  });
+  }));
 
   sock.ev.on('creds.update', saveCreds);
 
@@ -80,8 +81,13 @@ async function start(attempt = 0) {
         reason === DisconnectReason.connectionClosed ||
         reason === DisconnectReason.unavailableService ||
         reason === 405;
-      if (transient && qrTimer) {
+      const paired = Boolean(state.creds?.me?.id);
+      if (transient && qrTimer && !paired) {
         return;
+      }
+      if (qrTimer) {
+        clearTimeout(qrTimer);
+        qrTimer = null;
       }
       if (transient && attempt < 5) {
         setTimeout(() => start(attempt + 1), 1000);

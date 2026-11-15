@@ -7,7 +7,7 @@ import time
 from station.conductor.platforms import guidance
 from station.conductor.platforms.base import LocalPlatformAdapter
 from station.conductor.platforms.whatsapp_mention import is_whatsapp_broadcast_chat
-from station.conductor.util import node_bin, whatsapp_bridge_dir, ext_int, ext_str, ext_id, ext_bool
+from station.conductor.util import node_bin, whatsapp_bridge_dir, whatsapp_process_env, ext_int, ext_str, ext_id, ext_bool
 from station import logger
 from station.prototypes.boundary import ext_dict, ext_list
 from station.errors import ExternalError
@@ -45,6 +45,7 @@ class WhatsAppIO:
                 "--port",
                 "0",
                 cwd=bridge_dir,
+                env=whatsapp_process_env(self.conductor.config),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.DEVNULL,
             )
@@ -198,7 +199,7 @@ class WhatsAppAdapter(LocalPlatformAdapter):
         if method == "send_audio":
             return "audio"
         if method == "send_voice":
-            return "audio"
+            return "voice"
         if method == "send_animation":
             return "animation"
         return "document"
@@ -222,10 +223,6 @@ class WhatsAppAdapter(LocalPlatformAdapter):
         if file_bytes is None:
             return False
         kind = self._kind_from_method(method)
-        try:
-            guidance.check_media_size("whatsapp", len(file_bytes), guidance.media_kind_from_method(method))
-        except guidance.MediaTooLargeError:
-            return False
         filename = ext_str(payload.get("file_name"), "file_name", default="file")
         mime = ext_str(payload.get("content_type"), "content_type")
         prepared = guidance.prepare_outbound_caption("whatsapp", (caption or ""))
@@ -262,7 +259,7 @@ class WhatsAppAdapter(LocalPlatformAdapter):
                     user_id = ext_id(msg.get("user_id"), "user_id").strip()
                     message_id = ext_id(msg.get("message_id"), "message_id").strip()
                     media_id = ext_id(msg.get("media_id"), "media_id").strip()
-                    if not chat_id or (not text and not media_id):
+                    if not chat_id or is_whatsapp_broadcast_chat(chat_id) or (not text and not media_id):
                         continue
                     model_id = await self.conductor.ensure_chat_mapping(
                         acct_id=acct_id,
@@ -284,7 +281,7 @@ class WhatsAppAdapter(LocalPlatformAdapter):
                         )
                     native_chat = ext_str(msg.get("chat_type"), "chat_type").strip().lower()
                     if not native_chat:
-                        if chat_id.endswith("@g.us") or is_whatsapp_broadcast_chat(chat_id):
+                        if chat_id.endswith("@g.us"):
                             native_chat = "group"
                         else:
                             native_chat = "private"

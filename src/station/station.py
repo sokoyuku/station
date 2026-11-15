@@ -6,7 +6,7 @@ from aiohttp import web
 from station.client.context import ClientContext
 from station.database.consul_state import apply_consul_prototype
 from station.client.conductor import configure_outbound_concurrency
-from station.client.retry import apply_retry_config
+from station.client.retry import apply_retry_config, client_connector, client_session
 from station.config.config import Config
 from station.config.reload import apply_reloaded_config, reload_from_disk
 from station.database.database import create_database, wipe_station_runtime_data
@@ -149,8 +149,8 @@ class Station:
         else:
             conn_limit = 0
             per_host = 0
-        return aiohttp.ClientSession(
-            connector=aiohttp.TCPConnector(
+        return client_session(
+            connector=client_connector(
                 limit=conn_limit,
                 limit_per_host=per_host,
                 ttl_dns_cache=300,

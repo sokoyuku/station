@@ -41,6 +41,10 @@ def _retryable_cursor_error(error):
     return (error.status or 0) >= 500
 
 
+async def list_cursor_models(*, gateway, api_key):
+    return await gateway.client.models.list(api_key=api_key)
+
+
 async def start_cursor_gateway(*, workspace, state_root):
     os.makedirs(workspace, exist_ok=True)
     os.makedirs(state_root, exist_ok=True)
