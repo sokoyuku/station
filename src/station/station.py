@@ -1,6 +1,7 @@
 import asyncio
 import os
 import signal
+import time
 import aiohttp
 from aiohttp import web
 from station.client.context import ClientContext
@@ -11,6 +12,7 @@ from station.config.config import Config
 from station.config.reload import apply_reloaded_config, reload_from_disk
 from station.database.database import create_database, wipe_station_runtime_data
 from station.api.routes import Routes
+from station.api.station_app import mount_station_app
 from station.client.consul import fetch_prototype
 from station.webrtc import WebRTCService
 from station.discord_voice import DiscordVoiceService
@@ -44,6 +46,7 @@ class Station:
         prototype_config_file=None,
         prototype_secret_file=None,
         ava=None,
+        station_app=None,
         prototype=None,
         prototype_kind=None,
         kinds=None,
@@ -80,6 +83,8 @@ class Station:
             primary.secret_file = ext_str("prototype_secret_file", prototype_secret_file, default="").strip() or None
         if ava is not None:
             primary.ava = ava
+        if station_app is not None:
+            self.config.station_app = ext_bool("station_app", station_app)
 
         if kinds is not None:
             kinds = ext_dict("kinds", kinds)
@@ -179,13 +184,13 @@ class Station:
             yield
         finally:
             self.logger.info("station stopping")
+            for instance in list(app["instances"].values()):
+                await self._cleanup("cleanup instance stop", instance.stop())
+
             poller_gen = app.get("_local_conductor_poller")
             if poller_gen is not None:
                 await poller_gen.aclose()
                 app["_local_conductor_poller"] = None
-
-            for instance in list(app["instances"].values()):
-                await self._cleanup("cleanup instance stop", instance.stop())
 
             await self._cleanup("cleanup gateway_processes", app["gateway_processes"].close_all())
             await self._cleanup("cleanup discord_voice", app["discord_voice"].close())
@@ -313,6 +318,7 @@ class Station:
             )
             self.app["_station"] = self
             self.app["needs_manual"] = False
+            self.app["started_at"] = time.time()
             self.app.on_startup.append(self._register_sighup)
             self.app["_prototype_access_point"] = prototype_access_point
             self.app["env"] = self.config.env
@@ -411,6 +417,8 @@ class Station:
             Routes(self.app)
             setup_recorder_routes(self.app)
             self.app.router.add_get("/healthz", self.handle_health)
+            if self.config.station_app:
+                mount_station_app(self.app)
 
             self.app.cleanup_ctx.append(self._lifecycle_manager)
             self.app.cleanup_ctx.append(self.dedupe_cleanup)
@@ -439,10 +447,11 @@ class Station:
         if backlog < 128:
             backlog = 128
         self.logger.info(
-            "station starting host=%s port=%s env=%s",
+            "station starting host=%s port=%s env=%s app=%s",
             self.config.host,
             self.config.port,
             self.config.env,
+            self.config.station_app,
         )
         web.run_app(
             app,

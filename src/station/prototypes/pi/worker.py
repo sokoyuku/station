@@ -3,6 +3,7 @@ from dataclasses import dataclass, field
 from station import logger
 from station.prototypes.boundary import ext_dict, ext_str
 from station.prototypes.bridge_worker import PrototypeBridgeWorker
+from station.prototypes.chat_history import list_started_chats
 from station.timeouts import TURN_TIMEOUT_S, wait
 
 @dataclass(slots=True)
@@ -14,6 +15,27 @@ class PendingTurnMessage:
 class PiWorker(PrototypeBridgeWorker):
     def _bridge_worker_error_text(self, error):
         return "Pi bridge error: %s" % error
+
+    async def _resume_sessions(self):
+        gateway = self._gateway
+        if gateway is None:
+            return
+        for chat in list_started_chats(self.storage_dir):
+            acct_id = chat.get("acct_id") or ""
+            chat_id = chat.get("chat_id") or ""
+            if not acct_id or not chat_id:
+                continue
+            try:
+                await gateway.ensure_chat(acct_id=acct_id, chat_id=chat_id)
+            except Exception as e:
+                logger.error(
+                    "Pi resume on restore failed model_id=%s acct_id=%s chat_id=%s error=%s",
+                    self.model_id,
+                    acct_id,
+                    chat_id,
+                    e,
+                    exc_info=e,
+                )
 
     async def _interrupt_backend(self, *, session_id, chat_id, acct_id):
         gateway = self._gateway
@@ -76,8 +98,9 @@ class PiWorker(PrototypeBridgeWorker):
             rpc = await gateway.ensure_chat(acct_id=acct_id, chat_id=chat_id)
             state.busy = True
             try:
-                await rpc.prompt(message, images=images or None)
-                reply = await self._drain_events(rpc=rpc)
+                async with self.typing_while(chat_id=chat_id, acct_id=acct_id):
+                    await rpc.prompt(message, images=images or None)
+                    reply = await self._drain_events(rpc=rpc)
             finally:
                 state.busy = False
 

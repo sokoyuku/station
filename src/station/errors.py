@@ -1,6 +1,8 @@
 import re
+import sys
 
 _EDGE_CODE = re.compile(r"error code:\s*\d+", re.IGNORECASE)
+_SLUG = re.compile(r"[^a-z0-9]+")
 _COMMAND_FAILED = re.compile(r"^Command failed with status (\d+):", re.IGNORECASE)
 PUBLIC_UNAVAILABLE = "The service is temporarily unavailable."
 
@@ -30,12 +32,32 @@ def public_chat_error(text: str) -> str:
     return cleaned
 
 
+def slug(value) -> str:
+    text = _SLUG.sub("_", str(value or "").strip().lower()).strip("_")
+    if not text:
+        return "error"
+    if len(text) > 80:
+        return text[:80]
+    return text
+
+
+def auto_code(message, *, depth=1) -> str:
+    frame = sys._getframe(depth)
+    module = frame.f_globals.get("__name__", "")
+    func = slug(frame.f_code.co_name)
+    line = frame.f_lineno
+    prefix = "conductor.local" if "station.conductor" in module else "station"
+    return "%s.%s.L%s.%s" % (prefix, func, line, slug(message))
+
+
 class ExternalError(Exception):
-    def __init__(self, message, *, status=400, reason="", retryable=None):
+    def __init__(self, message, *, status=400, reason="", retryable=None, code="", cause_code=""):
         super().__init__(message)
         self.status = status
         self.reason = reason
         self.retryable = retryable
+        self.code = str(code or "").strip() or auto_code(message, depth=2)
+        self.cause_code = str(cause_code or "")
 
 
 class InternalError(Exception):

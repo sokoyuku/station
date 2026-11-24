@@ -78,6 +78,49 @@ async def create_cursor_agent(*, gateway, settings, acct_id, chat_id):
     raise last_error
 
 
+_ACTIVE_RUN_STATUS = "running"
+_RUN_LIST_PAGE_LIMIT = 5
+
+
+async def cancel_active_cursor_runs(*, gateway, settings, agent_id):
+    cancelled = []
+    page = await gateway.client.agents.list_runs(
+        agent_id,
+        cwd=settings.workspace_dir,
+        api_key=settings.api_key,
+        runtime="local",
+        limit=20,
+    )
+    for _ in range(_RUN_LIST_PAGE_LIMIT):
+        for run in page.items:
+            if run.status != _ACTIVE_RUN_STATUS or not run.id:
+                continue
+            await gateway.client.agents.cancel_run(run.id, agent_id=agent_id)
+            cancelled.append(run.id)
+        if not page.next_cursor:
+            break
+        page = await page.get_next_page()
+    return cancelled
+
+
+async def active_cursor_run(*, gateway, settings, agent_id):
+    page = await gateway.client.agents.list_runs(
+        agent_id,
+        cwd=settings.workspace_dir,
+        api_key=settings.api_key,
+        runtime="local",
+        limit=20,
+    )
+    for _ in range(_RUN_LIST_PAGE_LIMIT):
+        for run in page.items:
+            if run.status == _ACTIVE_RUN_STATUS and run.id:
+                return run
+        if not page.next_cursor:
+            return None
+        page = await page.get_next_page()
+    return None
+
+
 async def resume_cursor_agent(*, gateway, settings, agent_id):
     AgentOptions, _, _, LocalAgentOptions, _, _ = _load_sdk()
     return await gateway.client.resume_agent(

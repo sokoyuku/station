@@ -2,6 +2,7 @@ import json
 import sqlite3
 
 from station import instant
+from station.conductor.otp import apply_verify, expiry_text, fresh_otp, reusable
 from station.errors import ExternalError, InternalError
 from station.conductor.platform_types import strip_qr_prefix, validate_local_platform_type
 from station.database.request_dedupe import run_in_db_executor
@@ -56,6 +57,28 @@ class LocalConductorDatabaseMixin:
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_local_account_runtime_state_acct_id ON local_account_runtime_state(acct_id)"
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS local_chat_opened (
+                acct_id TEXT NOT NULL,
+                chat_id TEXT NOT NULL,
+                model_id TEXT NOT NULL,
+                PRIMARY KEY (acct_id, chat_id)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS local_otps (
+                model_id TEXT NOT NULL,
+                acct_id TEXT NOT NULL,
+                otp TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                attempts INTEGER NOT NULL,
+                PRIMARY KEY (model_id, acct_id)
+            )
+            """
+        )
 
     def _validate_runtime_state_identifiers(
         self,
@@ -101,7 +124,9 @@ class LocalConductorDatabaseMixin:
                     """,
                     (model_id,),
                 )
+                conn.execute("DELETE FROM local_otps WHERE model_id = ?", (model_id,))
                 conn.execute("DELETE FROM local_chats WHERE model_id = ?", (model_id,))
+                conn.execute("DELETE FROM local_chat_opened WHERE model_id = ?", (model_id,))
                 conn.execute("DELETE FROM local_accounts WHERE model_id = ?", (model_id,))
 
         await run_in_db_executor(_sync)
@@ -213,8 +238,10 @@ class LocalConductorDatabaseMixin:
 
         def _sync():
             with self._connect() as conn:
+                conn.execute("DELETE FROM local_otps WHERE acct_id = ?", (acct_id,))
                 conn.execute("DELETE FROM local_account_runtime_state WHERE acct_id = ?", (acct_id,))
                 conn.execute("DELETE FROM local_chats WHERE acct_id = ?", (acct_id,))
+                conn.execute("DELETE FROM local_chat_opened WHERE acct_id = ?", (acct_id,))
                 conn.execute("DELETE FROM local_accounts WHERE acct_id = ?", (acct_id,))
 
         await run_in_db_executor(_sync)
@@ -244,8 +271,17 @@ class LocalConductorDatabaseMixin:
 
         def _sync():
             with self._connect() as conn:
+                opened = {
+                    (row[0], row[1])
+                    for row in conn.execute(
+                        "SELECT acct_id, chat_id FROM local_chat_opened WHERE model_id = ?",
+                        (model_id,),
+                    ).fetchall()
+                }
                 conn.execute("DELETE FROM local_chats WHERE model_id = ?", (model_id,))
+                conn.execute("DELETE FROM local_chat_opened WHERE model_id = ?", (model_id,))
                 now = instant.format(instant.now())
+                kept = {(acct_id, chat_id) for acct_id, chat_id, _, _, _, _ in prepared}
                 for acct_id, chat_id, mid, pid, chat_type, carrier in prepared:
                     conn.execute(
                         """
@@ -254,6 +290,11 @@ class LocalConductorDatabaseMixin:
                         VALUES (?, ?, ?, ?, ?, ?, ?)
                         """,
                         (acct_id, chat_id, mid, pid, chat_type, carrier, now),
+                    )
+                for acct_id, chat_id in opened & kept:
+                    conn.execute(
+                        "INSERT OR REPLACE INTO local_chat_opened (acct_id, chat_id, model_id) VALUES (?, ?, ?)",
+                        (acct_id, chat_id, model_id),
                     )
 
         await run_in_db_executor(_sync)
@@ -350,7 +391,46 @@ class LocalConductorDatabaseMixin:
                     "DELETE FROM local_chats WHERE model_id = ? AND chat_id = ? AND acct_id = ?",
                     (model_id, chat_id, acct_id),
                 )
+                conn.execute(
+                    "DELETE FROM local_chat_opened WHERE acct_id = ? AND chat_id = ?",
+                    (acct_id, chat_id),
+                )
             return True
+
+        return await run_in_db_executor(_sync)
+
+    async def mark_local_chat_opened(self, *, acct_id: str, chat_id: str, model_id: str) -> None:
+        acct_id = (acct_id or "").strip()
+        chat_id = (chat_id or "").strip()
+        model_id = (model_id or "").strip()
+        if not (acct_id and chat_id and model_id):
+            return
+
+        def _sync():
+            with self._connect() as conn:
+                conn.execute(
+                    "INSERT OR REPLACE INTO local_chat_opened (acct_id, chat_id, model_id) VALUES (?, ?, ?)",
+                    (acct_id, chat_id, model_id),
+                )
+
+        await run_in_db_executor(_sync)
+
+    async def local_chat_opened(self, *, acct_id: str, chat_id: str, model_id: str) -> bool:
+        acct_id = (acct_id or "").strip()
+        chat_id = (chat_id or "").strip()
+        want = (model_id or "").replace("-", "").strip().lower()
+        if not (acct_id and chat_id and want):
+            return False
+
+        def _sync():
+            with self._connect() as conn:
+                row = conn.execute(
+                    "SELECT model_id FROM local_chat_opened WHERE acct_id = ? AND chat_id = ?",
+                    (acct_id, chat_id),
+                ).fetchone()
+            if not row:
+                return False
+            return (row[0] or "").replace("-", "").strip().lower() == want
 
         return await run_in_db_executor(_sync)
 
@@ -408,3 +488,70 @@ class LocalConductorDatabaseMixin:
                 )
 
         await run_in_db_executor(_sync)
+
+    async def generate_local_otp(self, model_id: str, acct_id: str) -> str:
+        model_id = (model_id or "").strip()
+        acct_id = (acct_id or "").strip()
+        if not model_id or not acct_id:
+            raise ExternalError("model_id and acct_id are required")
+
+        def _sync():
+            with self._connect() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                row = conn.execute(
+                    "SELECT otp, expires_at, attempts FROM local_otps WHERE model_id = ? AND acct_id = ?",
+                    (model_id, acct_id),
+                ).fetchone()
+                existing = None
+                if row:
+                    existing = {"otp": row[0], "expires_at": row[1], "attempts": row[2]}
+                kept = reusable(existing)
+                if kept:
+                    return kept
+                otp = fresh_otp()
+                conn.execute(
+                    """
+                    INSERT INTO local_otps (model_id, acct_id, otp, expires_at, attempts)
+                    VALUES (?, ?, ?, ?, 0)
+                    ON CONFLICT(model_id, acct_id) DO UPDATE SET
+                        otp = excluded.otp,
+                        expires_at = excluded.expires_at,
+                        attempts = 0
+                    """,
+                    (model_id, acct_id, otp, expiry_text()),
+                )
+                return otp
+
+        return await run_in_db_executor(_sync)
+
+    async def verify_local_otp(self, model_id: str, acct_id: str, token: str) -> bool:
+        model_id = (model_id or "").strip()
+        acct_id = (acct_id or "").strip()
+        token = "" if token is None else str(token)
+
+        def _sync():
+            with self._connect() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                row = conn.execute(
+                    "SELECT otp, expires_at, attempts FROM local_otps WHERE model_id = ? AND acct_id = ?",
+                    (model_id, acct_id),
+                ).fetchone()
+                if not row:
+                    return False
+                valid, replacement = apply_verify(
+                    {"otp": row[0], "expires_at": row[1], "attempts": row[2]},
+                    token,
+                )
+                if replacement is None:
+                    conn.execute(
+                        "DELETE FROM local_otps WHERE model_id = ? AND acct_id = ?",
+                        (model_id, acct_id),
+                    )
+                else:
+                    conn.execute(
+                        "UPDATE local_otps SET attempts = ? WHERE model_id = ? AND acct_id = ?",
+                        (replacement["attempts"], model_id, acct_id),
+                    )
+                return valid
+
+        return await run_in_db_executor(_sync)

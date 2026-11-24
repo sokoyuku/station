@@ -167,6 +167,59 @@ async def handle_admin_update_prototype_token(request):
         status=200,
     )
 
+_SIGNIN_STRINGS = (
+    "description",
+    "type",
+    "access_point",
+    "path",
+    "status",
+    "billing_interval",
+    "terms_of_use",
+    "privacy_policy",
+)
+_SIGNIN_BOOLS = ("private", "is_local", "call_support", "whatsapp_qr")
+_SIGNIN_INTS = ("max_chats", "max_models", "charge")
+
+
+async def _ensure_signed_in_prototype(config, name, body):
+    import aiohttp
+
+    from station.api.admin_commands import consul_credentials
+    from station.client.retry import client_session
+    from station.runner import _ensure_prototype, _sign_in
+    from station.timeouts import http_timeout
+
+    username, password = consul_credentials(config)
+    consul_url = (config.consul_url or "").strip()
+    if not consul_url:
+        raise ExternalError("CONSUL_URL is required")
+    payload = {"name": name}
+    for key in _SIGNIN_STRINGS:
+        if body.get(key) is None:
+            continue
+        value = ext_str(key, body.get(key), default="").strip()
+        if value:
+            payload[key] = value
+    for key in _SIGNIN_BOOLS:
+        if key in body and body.get(key) is not None:
+            payload[key] = ext_bool(key, body.get(key))
+    for key in _SIGNIN_INTS:
+        if key in body and body.get(key) not in (None, ""):
+            payload[key] = ext_int(key, body.get(key))
+    cookie_jar = aiohttp.CookieJar(unsafe=True)
+    async with client_session(cookie_jar=cookie_jar, timeout=http_timeout(), trust_env=False) as session:
+        await _sign_in(session=session, consul_url=consul_url, username=username, password=password)
+        try:
+            ensured = await _ensure_prototype(session=session, consul_url=consul_url, payload=payload)
+        except RuntimeError as exc:
+            raise ExternalError(str(exc)) from exc
+    prototype_id = ext_int("prototype_id", ensured.get("prototype_id"))
+    token = ext_str("token", ensured.get("token"), default="")
+    if not token:
+        raise ExternalError("ensure_prototype returned empty token")
+    return prototype_id, token
+
+
 async def handle_admin_add_prototype(request):
     denied = _require_admin(request)
     if denied is not None:
@@ -177,10 +230,17 @@ async def handle_admin_add_prototype(request):
     config = app["config"]
 
     body = await read_json_object(request)
-    prototype_id = ext_int("prototype_id", body.get("prototype_id"))
-    token = ext_str("token", body.get("token"), default="")
-    if not token:
-        raise ExternalError("Missing token")
+    signin = ext_bool("signin", body.get("signin", False))
+    prototype_id = None
+    token = ""
+    if signin:
+        if body.get("prototype_id") is not None or str(body.get("token") or "").strip():
+            raise ExternalError("do not pass prototype_id or token with signin")
+    else:
+        prototype_id = ext_int("prototype_id", body.get("prototype_id"))
+        token = ext_str("token", body.get("token"), default="")
+        if not token:
+            raise ExternalError("Missing token")
     kind = body.get("kind", "station")
     if kind is None:
         kind = "station"
@@ -190,6 +250,10 @@ async def handle_admin_add_prototype(request):
     name = body.get("name")
     if name is not None:
         name = ext_str("name", name, default="").strip() or None
+    if signin:
+        if not name:
+            raise ExternalError("name is required with signin")
+        prototype_id, token = await _ensure_signed_in_prototype(config, name, body)
     config_file = body.get("config_file")
     if config_file is not None:
         config_file = ext_str("config_file", config_file, default="").strip() or None

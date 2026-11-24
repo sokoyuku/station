@@ -844,6 +844,10 @@ def _build_run_parser(prog_name: str) -> argparse.ArgumentParser:
     parser.add_argument("--secret", dest="secret_path", default=None)
     parser.add_argument("--host", dest="host", default=None)
     parser.add_argument("--port", dest="port", type=int, default=None)
+    app_flag = parser.add_mutually_exclusive_group()
+    app_flag.add_argument("--app", dest="station_app", action="store_true")
+    app_flag.add_argument("--no-app", dest="station_app", action="store_false")
+    parser.set_defaults(station_app=None)
     parser.add_argument("--env", dest="env", default=None)
     parser.add_argument("--consul-url", dest="consul_url")
     parser.add_argument("--prototype-name", dest="prototype_name")
@@ -896,6 +900,7 @@ def _start_station(
         prototype_config_file=args.prototype_config_file,
         prototype_secret_file=args.prototype_secret_file,
         ava=args.ava,
+        station_app=args.station_app,
         prototype=prototype_class,
         prototype_kind=prototype_kind,
     ).start()

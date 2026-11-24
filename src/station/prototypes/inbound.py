@@ -432,9 +432,11 @@ class PrototypeInbound:
             self._at_least_once,
         )
         await self._recover_inbound_pending()
+        await self._restore_availability()
         return None
 
     async def stop(self):
+        await self._quiesce()
         async with self._start_lock:
             task = self._start_task
             self._start_task = None

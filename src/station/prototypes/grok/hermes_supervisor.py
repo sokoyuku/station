@@ -700,6 +700,32 @@ class GrokHermesSupervisor:
         body["ok"] = True
         return body
 
+    async def _interrupt_all_hermes(self):
+        if not getattr(self, "_hermes_ready", False):
+            return
+        targets = [
+            task
+            for task in self._hermes_tasks.values()
+            if task.status in {"running", "needs_approval"}
+        ]
+        if not targets:
+            return
+        gateway = self._hermes_gateway if self._gateway_running() else None
+        for task in targets:
+            if gateway is not None and task.session_id:
+                try:
+                    await gateway.interrupt_session(session_id=task.session_id)
+                except Exception as exc:
+                    logger.error(
+                        "Hermes interrupt on halt failed model_id=%s task_id=%s error=%s",
+                        self.model_id,
+                        task.task_id,
+                        exc,
+                        exc_info=exc,
+                    )
+            task.status = "interrupted"
+            await self._cancel_drain(task.task_id)
+
     async def _interrupt_hermes_chat(self, *, chat_id, acct_id):
         self._init_hermes_supervisor()
         targets = [
@@ -918,5 +944,6 @@ class GrokHermesSupervisor:
             await gateway.close()
 
     async def stop(self):
+        await self._quiesce()
         await self._close_hermes_supervisor()
         return await super().stop()

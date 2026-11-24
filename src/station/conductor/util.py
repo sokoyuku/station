@@ -6,7 +6,7 @@ from pathlib import Path
 
 from aiohttp import web
 
-from station.errors import ExternalError
+from station.errors import ExternalError, auto_code
 from station.prototypes.boundary import ext_bool as _b_bool
 from station.prototypes.boundary import ext_int as _b_int
 from station.prototypes.boundary import ext_optional_id
@@ -76,8 +76,12 @@ def ok(data=None, *, status=200, msg=None):
         payload["data"] = data
     return web.json_response(payload, status=status)
 
-def err(msg, *, status=400, data=None):
-    payload = {"ok": False, "msg": msg}
+def err(msg, *, status=400, data=None, code="", cause=""):
+    if not code:
+        code = auto_code(msg, depth=2)
+    payload = {"ok": False, "msg": msg, "code": code}
+    if cause:
+        payload["cause"] = cause
     if data is not None:
         payload["data"] = data
     return web.json_response(payload, status=status)
@@ -87,7 +91,7 @@ def catch_external(handler):
         try:
             return await handler(request)
         except ExternalError as e:
-            return err(str(e), status=e.status)
+            return err(str(e), status=e.status, code=e.code, cause=e.cause_code)
     return wrapped
 
 def normalize_http_url(raw):

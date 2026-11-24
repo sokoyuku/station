@@ -8,6 +8,7 @@ class ClientContext:
     prototype_id: int | None = None
     token: str | None = None
     prototype_version: int | None = None
+    model_versions: dict = field(default_factory=dict)
     db: object | None = None
     conductor_addresses: dict = field(default_factory=dict)
     app: object | None = None

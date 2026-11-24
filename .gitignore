@@ -1,3 +1,5 @@
+src/station/web/
+
 __pycache__/
 *.py[cod]
 *.egg-info/
@@ -10,7 +12,6 @@ env/
 
 node_modules/
 
-.pytest_cache/
 .coverage
 htmlcov/
 .mypy_cache/

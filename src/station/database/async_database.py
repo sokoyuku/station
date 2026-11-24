@@ -118,6 +118,14 @@ class AsyncDatabase(abc.ABC):
         raise NotImplementedError
 
     @abc.abstractmethod
+    async def mark_local_chat_opened(self, *, acct_id: str, chat_id: str, model_id: str) -> None:
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    async def local_chat_opened(self, *, acct_id: str, chat_id: str, model_id: str) -> bool:
+        raise NotImplementedError
+
+    @abc.abstractmethod
     async def get_local_account_runtime_state(
         self,
         *,
@@ -136,6 +144,14 @@ class AsyncDatabase(abc.ABC):
         state_key: str,
         state: dict,
     ) -> None:
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    async def generate_local_otp(self, model_id: str, acct_id: str) -> str:
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    async def verify_local_otp(self, model_id: str, acct_id: str, token: str) -> bool:
         raise NotImplementedError
 
     @abc.abstractmethod

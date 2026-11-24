@@ -25,6 +25,48 @@ from station.prototypes.boundary import ext_dict, ext_list
 from station.timeouts import http_timeout, ws_timeout
 
 _THREAD_CHANNEL_TYPES = {10, 11, 12}
+_DM_CHANNEL_TYPES = {1, 3}
+_API_VERSION_PREFIXES = ("/api/v10", "/api/v9")
+
+
+def discord_rest_url(base: str, path: str) -> str:
+    """Join a Discord or DSB root with an /api/v9 path.
+
+    Official config is https://discord.com/api/v9, and paths already start with
+    /api/v9. Appending those paths again requests /api/v9/api/v9/... and the
+    gateway fallback becomes wss://discord.com/api/v9/gateway, which Discord
+    rejects. DSB roots do not include /api/vN, so the path is appended whole.
+    """
+    root = (base or "").strip().rstrip("/")
+    suffix = path if str(path or "").startswith("/") else "/" + str(path or "")
+    lower_root = root.lower()
+    versioned = any(lower_root.endswith(prefix) for prefix in _API_VERSION_PREFIXES)
+    if versioned:
+        lower_suffix = suffix.lower()
+        for prefix in _API_VERSION_PREFIXES:
+            if lower_suffix.startswith(prefix):
+                suffix = suffix[len(prefix):]
+                break
+        if not suffix.startswith("/"):
+            suffix = "/" + suffix
+    return root + suffix
+
+
+def discord_gateway_fallback(base: str) -> str:
+    root = (base or "").strip().rstrip("/")
+    lower_root = root.lower()
+    for prefix in _API_VERSION_PREFIXES:
+        if lower_root.endswith(prefix):
+            root = root[: len(root) - len(prefix)].rstrip("/")
+            break
+    host = root.split("://", 1)[-1].split("/", 1)[0].lower()
+    if host == "discord.com" or host.endswith(".discord.com") or host == "discordapp.com" or host.endswith(".discordapp.com"):
+        return "wss://gateway.discord.gg"
+    if root.startswith("https://"):
+        return "wss://" + root[len("https://"):] + "/gateway"
+    if root.startswith("http://"):
+        return "ws://" + root[len("http://"):] + "/gateway"
+    return "ws://" + root + "/gateway"
 
 
 def _transcode_discord_voice(data: bytes) -> bytes | None:
@@ -140,6 +182,51 @@ def _discord_author_sender(author):
     return (global_name or username), username
 
 
+_DISCORD_EPOCH_MS = 1420070400000
+
+
+def discord_snowflake_greater(message_id: str, cursor: str) -> bool:
+    message_id = (message_id or "").strip()
+    cursor = (cursor or "").strip()
+    if not message_id:
+        return False
+    if cursor == "" or cursor == "0":
+        return True
+    try:
+        return int(message_id) > int(cursor)
+    except ValueError:
+        return message_id > cursor
+
+
+def discord_snowflake_recent(snowflake: str, *, now: float, window: float) -> bool:
+    snowflake = (snowflake or "").strip()
+    if not snowflake.isdigit():
+        return False
+    created = ((int(snowflake) >> 22) + _DISCORD_EPOCH_MS) / 1000.0
+    age = now - created
+    return age >= 0 and age <= window
+
+
+def dsb_inbound_ignored(message: dict, *, self_id: str) -> bool:
+    if not isinstance(message, dict):
+        return True
+    author = message.get("author")
+    if not isinstance(author, dict):
+        return True
+    author_id = ext_id(author.get("id"), "id").strip()
+    channel_id = ext_id(message.get("channel_id"), "channel_id").strip()
+    if not author_id or not channel_id:
+        return True
+    self_id = (self_id or "").strip()
+    if self_id and author_id == self_id:
+        return True
+    if ext_bool(author.get("bot"), "bot") or ext_bool(author.get("system"), "system"):
+        return True
+    if ext_int(message.get("type"), "type") not in (0, 19):
+        return True
+    return False
+
+
 def is_thread_channel_type(channel_type):
     return int(channel_type) in _THREAD_CHANNEL_TYPES
 
@@ -227,6 +314,8 @@ class _DiscordAcctState:
         "gateway_last_seq",
         "gateway_resume_url",
         "gateway_hb_ack",
+        "gateway_channels",
+        "backlog_threads",
     )
 
     def __init__(self) -> None:
@@ -242,12 +331,16 @@ class _DiscordAcctState:
         self.gateway_resume_url: str = ""
         self.gateway_hb_ack: bool = True
         self.gateway_session_id: str = ""
+        self.gateway_channels: dict[str, dict] = {}
+        self.backlog_threads: set[str] = set()
 
 class DiscordIO:
     def __init__(self, conductor):
         self.conductor = conductor
         self._accounts: dict[str, _DiscordAcctState] = {}
         self._dsb_channel_cursors: dict[str, dict[str, str]] = {}
+        self._dsb_msg_lock = asyncio.Lock()
+        self._dsb_inflight: set[tuple[str, str, str]] = set()
 
     def _acct_state(self, acct_id: str) -> _DiscordAcctState:
         if not acct_id:
@@ -387,13 +480,14 @@ class DiscordIO:
         force = custom_id.startswith("/start")
         model_id = None if force else (await self.conductor.db.lookup_model_for_chat(acct_id=acct_id, chat_id=open_id))
         if not model_id:
-            model_id = await self.conductor.ensure_chat_mapping(
+            mapped = await self.conductor.ensure_chat_mapping(
                 acct_id=acct_id,
                 chat_id=open_id,
                 chat_type="discord",
                 carrier_user_id=user_id,
                 force=force,
             )
+            model_id = mapped.model_id
         if not model_id:
             return
         msg_id = f"interaction:{(interaction_id or '').strip() or channel_id}"
@@ -521,13 +615,14 @@ class DiscordIO:
         chat_id, open_id, chat_type = await self.resolve_message_chat_thread(token=token, channel_id=channel_id)
         model_id = await self.conductor.db.lookup_model_for_chat(acct_id=acct_id, chat_id=open_id)
         if not model_id:
-            model_id = await self.conductor.ensure_chat_mapping(
+            mapped = await self.conductor.ensure_chat_mapping(
                 acct_id=acct_id,
                 chat_id=open_id,
                 chat_type="discord",
                 carrier_user_id=user_id,
                 force=False,
             )
+            model_id = mapped.model_id
         if not model_id:
             return
         body = {
@@ -567,7 +662,7 @@ class DiscordIO:
         base = self._api_base()
         if not base:
             return 0, None
-        url = f"{base}{path}"
+        url = discord_rest_url(base, path)
         headers = {"Authorization": "Bot " + (token or "").strip()}
 
         async def _once():
@@ -910,7 +1005,7 @@ class DiscordIO:
         base = self._api_base()
         if not base:
             return False
-        url = f"{base}/api/v9/channels/{channel_id}/messages"
+        url = discord_rest_url(base, f"/api/v9/channels/{channel_id}/messages")
         headers = {"Authorization": "Bot " + (token or "").strip()}
         allowed = guidance.default_discord_allowed_mentions()
         if file_bytes is None:
@@ -1031,12 +1126,13 @@ class DiscordIO:
             return
         model_id = await self.conductor.db.lookup_model_for_chat(acct_id=acct_id, chat_id=open_chat_id(relay_chat_id))
         if not model_id:
-            model_id = await self.conductor.ensure_chat_mapping(
+            mapped = await self.conductor.ensure_chat_mapping(
                 acct_id=acct_id,
                 chat_id=open_chat_id(relay_chat_id),
                 chat_type="discord",
                 carrier_user_id=user_id or None,
             )
+            model_id = mapped.model_id
         if not model_id:
             return
         update_id = f"{event_type}:{relay_chat_id}:{int(time.time() * 1000)}"
@@ -1122,6 +1218,38 @@ class DiscordIO:
         return st.gateway_ws is not None and not st.gateway_ws.closed and st.gateway_token == token
 
     async def _handle_dsb_dispatch(self, st, *, acct_id: str, token: str, event_type: str, data: dict) -> None:
+        if event_type in ("CHANNEL_CREATE", "CHANNEL_UPDATE", "THREAD_CREATE", "THREAD_UPDATE"):
+            self._note_gateway_channel(st, data)
+            if event_type == "THREAD_CREATE":
+                channel_id = ext_id(data.get("id"), "id").strip()
+                if ext_bool(data.get("newly_created"), "newly_created"):
+                    st.backlog_threads.discard(channel_id)
+                    async with self._dsb_msg_lock:
+                        cursors = self._get_cursors(acct_id)
+                        if channel_id and not (cursors.get(channel_id) or "").strip():
+                            cursors[channel_id] = "0"
+                            save_cursor = True
+                        else:
+                            save_cursor = False
+                    if save_cursor:
+                        await self._save_runtime_state(acct_id, mode="dsb")
+                elif channel_id:
+                    st.backlog_threads.add(channel_id)
+            return
+        if event_type == "GUILD_CREATE":
+            if not ext_bool(data.get("unavailable"), "unavailable"):
+                self._note_gateway_threads(st, data.get("channels"))
+                self._note_gateway_threads(st, data.get("threads"))
+            return
+        if event_type == "THREAD_LIST_SYNC":
+            self._note_gateway_threads(st, data.get("threads"))
+            return
+        if event_type == "MESSAGE_CREATE":
+            if ext_id(data.get("guild_id"), "guild_id").strip():
+                await self._deliver_dsb_guild_thread_message(st, acct_id=acct_id, token=token, data=data)
+            else:
+                await self._deliver_dsb_direct_message(st, acct_id=acct_id, token=token, data=data)
+            return
         if event_type == "MESSAGE_REACTION_ADD":
             await self._deliver_reaction_payload(acct_id=acct_id, data=data, removed=False)
             return
@@ -1239,22 +1367,21 @@ class DiscordIO:
             st.voice_pending[guild_id] = pending
             self._maybe_emit_credentials(acct_id, guild_id)
 
-    async def _dsb_gateway_loop(self, *, acct_id: str, token: str) -> None:
-        st = self._acct_state(acct_id)
+    async def _dsb_gateway_url(self, *, token: str) -> str:
         base = self._api_base()
-        if not base:
-            return
         status, payload = await self._dsb_request(method="GET", token=token, path="/api/v9/gateway/bot")
         gateway_url = ""
         if status == 200 and isinstance(payload, dict):
             gateway_url = ext_str(payload.get("url"), "url").strip()
         if not gateway_url:
-            if base.startswith("https://"):
-                gateway_url = "wss://" + base[len("https://"):] + "/gateway"
-            elif base.startswith("http://"):
-                gateway_url = "ws://" + base[len("http://"):] + "/gateway"
-            else:
-                gateway_url = "ws://" + base + "/gateway"
+            gateway_url = discord_gateway_fallback(base)
+        return gateway_url
+
+    async def _dsb_gateway_loop(self, *, acct_id: str, token: str) -> None:
+        st = self._acct_state(acct_id)
+        base = self._api_base()
+        if not base:
+            return
         dispatch_q: asyncio.Queue = asyncio.Queue()
 
         async def _drain_dispatch() -> None:
@@ -1276,6 +1403,7 @@ class DiscordIO:
         try:
             connect_mode = "identify"
             while st.gateway_token == token and not self.conductor.poller_stop.is_set():
+                gateway_url = await self._dsb_gateway_url(token=token)
                 connect_mode = await self._dsb_gateway_session(
                     st,
                     acct_id=acct_id,
@@ -1602,7 +1730,8 @@ class DiscordIO:
             force = content.startswith("/start")
             model_id = None if force else (await self.conductor.db.lookup_model_for_chat(acct_id=acct_id, chat_id=open_id))
             if not model_id:
-                model_id = await self.conductor.ensure_chat_mapping(acct_id=acct_id, chat_id=open_id, chat_type="discord", carrier_user_id=author_id, force=force)
+                mapped = await self.conductor.ensure_chat_mapping(acct_id=acct_id, chat_id=open_id, chat_type="discord", carrier_user_id=author_id, force=force)
+                model_id = mapped.model_id
             if not model_id:
                 return
             attachments, size_note = self._event_attachments(
@@ -1860,48 +1989,421 @@ class DiscordIO:
                 return False, "latency_exceeded"
         return True, "healthy"
 
+    def _note_gateway_channel(self, st, data: dict) -> None:
+        if not isinstance(data, dict):
+            return
+        channel_id = ext_id(data.get("id"), "id").strip()
+        if not channel_id:
+            return
+        prev = st.gateway_channels.get(channel_id) or {}
+        parent_id = ext_id(data.get("parent_id"), "parent_id").strip() or prev.get("parent_id") or ""
+        guild_id = ext_id(data.get("guild_id"), "guild_id").strip() or prev.get("guild_id") or ""
+        if data.get("type") is None:
+            channel_type = prev.get("type") or 0
+        else:
+            channel_type = ext_int(data.get("type"), "type")
+        st.gateway_channels[channel_id] = {
+            "parent_id": parent_id,
+            "type": channel_type,
+            "guild_id": guild_id,
+        }
+
+    def _note_gateway_threads(self, st, threads) -> None:
+        if threads is None:
+            return
+        for th in ext_list("discord threads", threads):
+            self._note_gateway_channel(st, ext_dict("discord thread", th))
+
+    def _channel_open_id(self, channel_id: str, meta: dict) -> str:
+        _, open_id, _ = resolve_chat_and_thread(
+            channel_id,
+            ext_str((meta or {}).get("parent_id"), "parent_id").strip(),
+            ext_int((meta or {}).get("type"), "type"),
+        )
+        return open_id or channel_id
+
+    def _thread_lookup_meta(self, st, directory, meta: dict) -> dict:
+        meta = meta or {}
+        if not is_thread_channel_type(ext_int(meta.get("type"), "type")):
+            return meta
+        parent_id = ext_str(meta.get("parent_id"), "parent_id").strip()
+        if not parent_id:
+            return meta
+        parent = {}
+        if directory:
+            parent = directory.get(parent_id) or {}
+        if not parent:
+            parent = st.gateway_channels.get(parent_id) or {}
+        open_id = self._channel_open_id(parent_id, parent)
+        if not open_id:
+            return meta
+        out = dict(meta)
+        out["open_id"] = open_id
+        return out
+
+    def _dsb_gateway_live(self, st) -> bool:
+        ws = st.gateway_ws
+        return ws is not None and not ws.closed and st.gateway_ready.is_set()
+
+    async def _deliver_dsb_direct_message(self, st, *, acct_id: str, token: str, data: dict) -> None:
+        if not isinstance(data, dict):
+            return
+        if ext_id(data.get("guild_id"), "guild_id").strip():
+            return
+        channel_id = ext_id(data.get("channel_id"), "channel_id").strip()
+        if not channel_id:
+            return
+        info = await self.get_channel_info(token=token, channel_id=channel_id)
+        channel_type = 0
+        parent_id = ""
+        if isinstance(info, dict):
+            channel_type = ext_int(info.get("type"), "type")
+            parent_id = ext_id(info.get("parent_id"), "parent_id").strip()
+        if channel_type not in _DM_CHANNEL_TYPES:
+            return
+        result = await self._accept_dsb_message(
+            acct_id=acct_id,
+            st=st,
+            channel_id=channel_id,
+            message=data,
+            channel_meta={"parent_id": parent_id, "type": channel_type},
+        )
+        if result == "advance":
+            await self._save_runtime_state(acct_id, mode="dsb")
+
+    async def _deliver_dsb_guild_thread_message(self, st, *, acct_id: str, token: str, data: dict) -> None:
+        if not isinstance(data, dict):
+            return
+        channel_id = ext_id(data.get("channel_id"), "channel_id").strip()
+        if not channel_id:
+            return
+        known = st.gateway_channels.get(channel_id)
+        if not known:
+            info = await self.get_channel_info(token=token, channel_id=channel_id)
+            if not isinstance(info, dict):
+                return
+            self._note_gateway_channel(st, info)
+            known = st.gateway_channels.get(channel_id) or {}
+        channel_type = ext_int(known.get("type"), "type")
+        if not is_thread_channel_type(channel_type):
+            return
+        parent_id = ext_str(known.get("parent_id"), "parent_id").strip()
+        if parent_id and parent_id not in st.gateway_channels:
+            parent_info = await self.get_channel_info(token=token, channel_id=parent_id)
+            if isinstance(parent_info, dict):
+                self._note_gateway_channel(st, parent_info)
+        msg_id = ext_id(data.get("id"), "id").strip()
+        if msg_id.isdigit():
+            async with self._dsb_msg_lock:
+                cursors = self._get_cursors(acct_id)
+                if not (cursors.get(channel_id) or "").strip():
+                    cursors[channel_id] = str(int(msg_id) - 1)
+        result = await self._accept_dsb_message(
+            acct_id=acct_id,
+            st=st,
+            channel_id=channel_id,
+            message=data,
+            channel_meta=self._thread_lookup_meta(
+                st, None, {"parent_id": parent_id, "type": channel_type},
+            ),
+        )
+        if result == "advance":
+            await self._save_runtime_state(acct_id, mode="dsb")
+
+    async def _accept_dsb_message(self, *, acct_id: str, st, channel_id: str, message: dict, channel_meta: dict) -> str:
+        message = ext_dict("discord message", message)
+        channel_id = (channel_id or "").strip()
+        msg_id = ext_id(message.get("id"), "id").strip()
+        if not channel_id or not msg_id:
+            return "skip"
+        if not ext_id(message.get("channel_id"), "channel_id").strip():
+            message = dict(message)
+            message["channel_id"] = channel_id
+        key = (acct_id, channel_id, msg_id)
+        async with self._dsb_msg_lock:
+            cursors = self._get_cursors(acct_id)
+            if key in self._dsb_inflight:
+                return "skip"
+            if not discord_snowflake_greater(msg_id, cursors.get(channel_id, "")):
+                return "skip"
+            self._dsb_inflight.add(key)
+            try:
+                result = await self._consume_dsb_message(
+                    acct_id=acct_id,
+                    st=st,
+                    channel_id=channel_id,
+                    message=message,
+                    channel_meta=channel_meta,
+                )
+                if result == "advance":
+                    cursors[channel_id] = msg_id
+                return result
+            finally:
+                self._dsb_inflight.discard(key)
+
+    async def _consume_dsb_message(self, *, acct_id: str, st, channel_id: str, message: dict, channel_meta: dict) -> str:
+        author = message.get("author")
+        author = ext_dict("discord message author", author)
+        author_id = ext_id(author.get("id"), "id").strip() or None
+        self_id = ext_id(st.gateway_user_id, "gateway_user_id").strip()
+        if dsb_inbound_ignored(message, self_id=self_id):
+            return "advance"
+        content = ext_str(message.get("content"), "content").strip()
+        sticker_raw = message.get("sticker_items")
+        if sticker_raw is None:
+            sticker_raw = message.get("stickers")
+        if sticker_raw is None:
+            sticker_list = []
+        else:
+            sticker_list = ext_list("discord stickers", sticker_raw)
+        atts_raw = message.get("attachments")
+        if atts_raw is None:
+            atts_raw = []
+        else:
+            atts_raw = ext_list("discord attachments", atts_raw)
+        attachments, size_note = self._dsb_attachments(atts_raw, stickers=sticker_list)
+        if size_note:
+            content = f"{content}\n{size_note}".strip() if content else size_note
+        meta = channel_meta or {}
+        chat_id, open_id, chat_type = resolve_chat_and_thread(
+            channel_id,
+            meta.get("parent_id") or "",
+            meta.get("type") or 0,
+        )
+        lookup_id = ext_str(meta.get("open_id"), "open_id").strip()
+        if lookup_id:
+            open_id = lookup_id
+        force = content.startswith("/start")
+        model_id = None if force else (await self.conductor.db.lookup_model_for_chat(acct_id=acct_id, chat_id=open_id))
+        if not model_id:
+            mapped = await self.conductor.ensure_chat_mapping(
+                acct_id=acct_id,
+                chat_id=open_id,
+                chat_type="discord",
+                carrier_user_id=author_id,
+                force=force,
+            )
+            model_id = mapped.model_id
+        if not model_id:
+            return "advance" if mapped.settled else "stop"
+        ref = message.get("message_reference")
+        reply_to = ""
+        reply_snippet = ""
+        if ref is not None:
+            ref = ext_dict("discord message_reference", ref)
+            reply_to = ext_id(ref.get("message_id"), "message_id").strip()
+        referenced = message.get("referenced_message")
+        if referenced is not None:
+            referenced = ext_dict("discord referenced_message", referenced)
+            reply_snippet = ext_str(referenced.get("content"), "content").strip()
+            if not reply_to:
+                reply_to = ext_id(referenced.get("id"), "id").strip()
+            if not reply_snippet:
+                ref_atts = referenced.get("attachments")
+                ref_stickers = referenced.get("sticker_items")
+                if ref_stickers is None:
+                    ref_stickers = referenced.get("stickers")
+                if ref_atts is not None:
+                    ref_atts = ext_list("discord referenced attachments", ref_atts)
+                if ref_stickers is not None:
+                    ref_stickers = ext_list("discord referenced stickers", ref_stickers)
+                if (isinstance(ref_atts, list) and ref_atts) or (isinstance(ref_stickers, list) and ref_stickers):
+                    reply_snippet = "(attachment)"
+        reply_to_text = guidance.telegram_reply_snippet(reply_snippet)
+        content = guidance.inject_reply_context(content, reply_to_text)
+        if not content and attachments:
+            for a in attachments:
+                if a.get("type") == "sticker":
+                    name = ext_str(a.get("file_name"), "file_name").strip()
+                    if a.get("is_animated") or not ext_str(a.get("url"), "url").strip():
+                        content = guidance.animated_sticker_injection(name)
+                    else:
+                        content = guidance.sticker_injection(name or "a sticker", "", "")
+                    break
+        msg_id = ext_id(message.get("id"), "id").strip()
+        body = {
+            "method": "send_message",
+            "params": {"text": content},
+            "text": content,
+            "caption": "",
+            "attachments": attachments,
+            "msg_id": msg_id,
+            "platform": "discord",
+            "user_id": author_id or "",
+        }
+        sender_name, sender_username = _discord_author_sender(author)
+        apply_sender(body, name=sender_name, username=sender_username)
+        if reply_to:
+            body["reply_to"] = reply_to
+        if reply_to_text:
+            body["reply_to_text"] = reply_to_text
+        if chat_type:
+            body["chat_type"] = chat_type
+        ref_author = ""
+        referenced = message.get("referenced_message")
+        if referenced is not None:
+            referenced = ext_dict("discord referenced_message", referenced)
+            ref_user = referenced.get("author")
+            if ref_user is not None:
+                ref_user = ext_dict("discord referenced author", ref_user)
+                ref_author = ext_id(ref_user.get("id"), "id").strip()
+        body["mentioned"] = discord_mentions_bot(
+            bot_id=self_id,
+            content=ext_str(message.get("content"), "content"),
+            mention_ids=_discord_mention_ids_from_users(message.get("mentions")),
+            referenced_author_id=ref_author,
+        )
+        if not content and not attachments:
+            body["raw"] = message
+        ok = await self.conductor.deliver_inbound(
+            model_id=model_id,
+            acct_id=acct_id,
+            chat_id=chat_id,
+            request_id=msg_id,
+            body=body,
+        )
+        if not ok:
+            return "stop"
+        return "advance"
+
     async def _dsb_poller_loop(self, *, acct_id: str, token: str) -> None:
+        # Discord allows 10 guild channel-list calls per 60 seconds. Stay under that,
+        # keep the last good list when a call fails, and poll channels learned from
+        # gateway create events without waiting for the next list.
+        directory_refresh_seconds = 8.0
+        message_poll_seconds = 2.0
         refresh_at = 0.0
-        channel_ids: list[str] = []
+        guild_channels: dict[str, list[str]] = {}
+        dm_ids: list[str] = []
         channel_meta: dict[str, dict] = {}
+        next_message_at: dict[str, float] = {}
         await self._load_runtime_state(acct_id)
         st = self._acct_state(acct_id)
         if not st.gateway_user_id:
             status, me = await self._dsb_request(method="GET", token=token, path="/api/v9/users/@me")
             if status == 200 and isinstance(me, dict):
                 st.gateway_user_id = ext_id(me.get("id"), "id").strip()
+
+        def listed_channel_ids() -> list[str]:
+            out: list[str] = []
+            seen: set[str] = set()
+            for ids in guild_channels.values():
+                for cid in ids:
+                    if cid not in seen:
+                        out.append(cid)
+                        seen.add(cid)
+            for cid in dm_ids:
+                if cid not in seen:
+                    out.append(cid)
+                    seen.add(cid)
+            for cid, meta in st.gateway_channels.items():
+                if cid not in channel_meta:
+                    channel_meta[cid] = {
+                        "parent_id": ext_str(meta.get("parent_id"), "parent_id").strip(),
+                        "type": ext_int(meta.get("type"), "type"),
+                    }
+                if cid not in seen:
+                    out.append(cid)
+                    seen.add(cid)
+            return out
+
         while not self.conductor.poller_stop.is_set():
             try:
                 now = time.time()
                 state_dirty = False
                 cursors = self._get_cursors(acct_id)
                 if now >= refresh_at:
-                    refresh_at = now + 2.0
+                    refresh_at = now + directory_refresh_seconds
                     status, guilds = await self._dsb_request(method="GET", token=token, path="/api/v9/users/@me/guilds")
                     if status == 200 and isinstance(guilds, list):
-                        next_channels: list[str] = []
-                        next_meta: dict[str, dict] = {}
+                        seen_gids: set[str] = set()
                         for g in guilds:
                             g = ext_dict('discord guild', g)
                             gid = ext_id(g.get("id"), "id").strip()
                             if not gid:
                                 continue
+                            seen_gids.add(gid)
                             cStatus, channels = await self._dsb_request(method="GET", token=token, path=f"/api/v9/guilds/{gid}/channels")
                             if cStatus != 200 or not isinstance(channels, list):
                                 continue
+                            ids: list[str] = []
                             for ch in channels:
                                 ch = ext_dict('discord channel', ch)
                                 cid = ext_id(ch.get("id"), "id").strip()
-                                if cid:
-                                    next_channels.append(cid)
-                                    next_meta[cid] = {
-                                        "parent_id": ext_id(ch.get("parent_id"), "parent_id").strip(),
-                                        "type": ext_int(ch.get("type"), "type"),
+                                if not cid:
+                                    continue
+                                ids.append(cid)
+                                channel_meta[cid] = {
+                                    "parent_id": ext_id(ch.get("parent_id"), "parent_id").strip(),
+                                    "type": ext_int(ch.get("type"), "type"),
+                                }
+                            t_status, active = await self._dsb_request(
+                                method="GET",
+                                token=token,
+                                path=f"/api/v9/guilds/{gid}/threads/active",
+                            )
+                            seen_ids = set(ids)
+                            if t_status == 200 and isinstance(active, dict):
+                                raw_threads = active.get("threads")
+                                if raw_threads is None:
+                                    raw_threads = []
+                                else:
+                                    raw_threads = ext_list("discord active threads", raw_threads)
+                                for th in raw_threads:
+                                    th = ext_dict("discord thread", th)
+                                    cid = ext_id(th.get("id"), "id").strip()
+                                    if not cid or cid in seen_ids:
+                                        continue
+                                    ids.append(cid)
+                                    seen_ids.add(cid)
+                                    channel_meta[cid] = {
+                                        "parent_id": ext_id(th.get("parent_id"), "parent_id").strip(),
+                                        "type": ext_int(th.get("type"), "type"),
                                     }
-                        channel_ids = next_channels
-                        channel_meta = next_meta
+                            else:
+                                for cid in guild_channels.get(gid) or []:
+                                    meta = channel_meta.get(cid) or {}
+                                    if cid in seen_ids or not is_thread_channel_type(meta.get("type") or 0):
+                                        continue
+                                    ids.append(cid)
+                                    seen_ids.add(cid)
+                            old = set(guild_channels.get(gid) or [])
+                            guild_channels[gid] = ids
+                            for gone in old - set(ids):
+                                if gone not in dm_ids:
+                                    channel_meta.pop(gone, None)
+                        for gone_gid in set(guild_channels) - seen_gids:
+                            for cid in guild_channels.pop(gone_gid):
+                                if cid not in dm_ids:
+                                    channel_meta.pop(cid, None)
+                    dm_status, dm_channels = await self._dsb_request(
+                        method="GET", token=token, path="/api/v9/users/@me/channels",
+                    )
+                    if dm_status == 200 and isinstance(dm_channels, list):
+                        next_dms: list[str] = []
+                        for ch in dm_channels:
+                            ch = ext_dict("discord dm channel", ch)
+                            cid = ext_id(ch.get("id"), "id").strip()
+                            if not cid:
+                                continue
+                            next_dms.append(cid)
+                            channel_meta[cid] = {
+                                "parent_id": "",
+                                "type": ext_int(ch.get("type"), "type"),
+                            }
+                        still_in_guild = {cid for ids in guild_channels.values() for cid in ids}
+                        for gone in set(dm_ids) - set(next_dms):
+                            if gone not in still_in_guild:
+                                channel_meta.pop(gone, None)
+                        dm_ids = next_dms
 
-                for channel_id in channel_ids:
+                for channel_id in listed_channel_ids():
+                    meta = channel_meta.get(channel_id) or {}
+                    if ext_int(meta.get("type"), "type") in _DM_CHANNEL_TYPES and self._dsb_gateway_live(st):
+                        continue
+                    if now < next_message_at.get(channel_id, 0):
+                        continue
+                    next_message_at[channel_id] = now + message_poll_seconds
                     cursor = ext_str(cursors.get(channel_id), "cursor").strip()
                     msgs: list[Any] = []
                     if not cursor:
@@ -1911,25 +2413,34 @@ class DiscordIO:
                             path=f"/api/v9/channels/{channel_id}/messages",
                             params={"limit": "1"},
                         )
-                        if status != 200 or not isinstance(seed_msgs, list):
-                            continue
-                        if not seed_msgs:
-                            cursors[channel_id] = "0"
-                            state_dirty = True
-                            continue
-                        seed = seed_msgs[0]
-                        seed = ext_dict('discord seed message', seed)
-                        seed_id = ext_id(seed.get("id"), "id").strip()
-                        if not seed_id:
-                            continue
-                        author = seed.get("author")
-                        is_bot = isinstance(author, dict) and bool(author.get("bot"))
-                        content = ext_str(seed.get("content"), "content").strip()
-                        if (not is_bot) and content.startswith("/start"):
-                            msgs = [seed]
-                        else:
-                            cursors[channel_id] = seed_id
-                            state_dirty = True
+                        async with self._dsb_msg_lock:
+                            cursor = (cursors.get(channel_id) or "").strip()
+                            if not cursor:
+                                if status != 200 or not isinstance(seed_msgs, list):
+                                    cursor = ""
+                                elif not seed_msgs:
+                                    cursors[channel_id] = "0"
+                                    state_dirty = True
+                                    cursor = "0"
+                                else:
+                                    seed = seed_msgs[0]
+                                    seed = ext_dict('discord seed message', seed)
+                                    seed_id = ext_id(seed.get("id"), "id").strip()
+                                    author = seed.get("author") if seed_id else None
+                                    is_bot = isinstance(author, dict) and bool(author.get("bot"))
+                                    content = ext_str(seed.get("content"), "content").strip() if seed_id else ""
+                                    if seed_id and (not is_bot) and content.startswith("/start"):
+                                        msgs = [seed]
+                                    elif seed_id and is_thread_channel_type(ext_int(meta.get("type"), "type")) and channel_id not in st.backlog_threads and discord_snowflake_recent(channel_id, now=now, window=180):
+                                        cursors[channel_id] = "0"
+                                        cursor = "0"
+                                    elif seed_id:
+                                        cursors[channel_id] = seed_id
+                                        state_dirty = True
+                                        cursor = "skip"
+                                    else:
+                                        cursor = ""
+                        if cursor == "skip":
                             continue
                     if cursor and not msgs:
                         status, fetched = await self._dsb_request(
@@ -1942,146 +2453,18 @@ class DiscordIO:
                             continue
                         msgs = list(reversed(fetched))
                     for m in msgs:
-                        m = ext_dict('discord message', m)
-                        msg_id = ext_id(m.get("id"), "id").strip()
-                        if not msg_id:
-                            continue
-                        author = m.get("author")
-                        author = ext_dict('discord message author', author)
-                        author_id = ext_id(author.get("id"), "id").strip() or None
-                        self_id = ext_id(st.gateway_user_id, "gateway_user_id").strip()
-                        msg_type = ext_int(m.get("type"), "type")
-                        if ext_bool(author.get("bot"), "bot") or ext_bool(author.get("system"), "system"):
-                            cursors[channel_id] = msg_id
-                            state_dirty = True
-                            continue
-                        if self_id and author_id == self_id:
-                            cursors[channel_id] = msg_id
-                            state_dirty = True
-                            continue
-                        if msg_type not in (0, 19):
-                            cursors[channel_id] = msg_id
-                            state_dirty = True
-                            continue
-                        content = ext_str(m.get("content"), "content").strip()
-                        sticker_raw = m.get("sticker_items")
-                        if sticker_raw is None:
-                            sticker_raw = m.get("stickers")
-                        if sticker_raw is None:
-                            sticker_list = []
-                        else:
-                            sticker_raw = ext_list('discord stickers', sticker_raw)
-                            sticker_list = sticker_raw
-                        atts_raw = m.get("attachments")
-                        if atts_raw is None:
-                            atts_raw = []
-                        else:
-                            atts_raw = ext_list('discord attachments', atts_raw)
-                        attachments, size_note = self._dsb_attachments(
-                            atts_raw,
-                            stickers=sticker_list,
-                        )
-                        if size_note:
-                            content = f"{content}\n{size_note}".strip() if content else size_note
-                        meta = channel_meta.get(channel_id) or {}
-                        chat_id, open_id, chat_type = resolve_chat_and_thread(
-                            channel_id,
-                            meta.get("parent_id") or "",
-                            meta.get("type") or 0,
-                        )
-                        force = content.startswith("/start")
-                        model_id = None if force else (await self.conductor.db.lookup_model_for_chat(acct_id=acct_id, chat_id=open_id))
-                        if not model_id:
-                            model_id = await self.conductor.ensure_chat_mapping(
-                                acct_id=acct_id,
-                                chat_id=open_id,
-                                chat_type="discord",
-                                carrier_user_id=author_id,
-                                force=force,
-                            )
-                        if not model_id:
-                            break
-                        ref = m.get("message_reference")
-                        reply_to = ""
-                        reply_snippet = ""
-                        if ref is not None:
-                            ref = ext_dict('discord message_reference', ref)
-                            reply_to = ext_id(ref.get("message_id"), "message_id").strip()
-                        referenced = m.get("referenced_message")
-                        if referenced is not None:
-                            referenced = ext_dict('discord referenced_message', referenced)
-                            reply_snippet = ext_str(referenced.get("content"), "content").strip()
-                            if not reply_to:
-                                reply_to = ext_id(referenced.get("id"), "id").strip()
-                            if not reply_snippet:
-                                ref_atts = referenced.get("attachments")
-                                ref_stickers = referenced.get("sticker_items")
-                                if ref_stickers is None:
-                                    ref_stickers = referenced.get("stickers")
-                                if ref_atts is not None:
-                                    ref_atts = ext_list('discord referenced attachments', ref_atts)
-                                if ref_stickers is not None:
-                                    ref_stickers = ext_list('discord referenced stickers', ref_stickers)
-                                if (isinstance(ref_atts, list) and ref_atts) or (
-                                    isinstance(ref_stickers, list) and ref_stickers
-                                ):
-                                    reply_snippet = "(attachment)"
-                        reply_to_text = guidance.telegram_reply_snippet(reply_snippet)
-                        content = guidance.inject_reply_context(content, reply_to_text)
-                        if not content and attachments:
-                            for a in attachments:
-                                if a.get("type") == "sticker":
-                                    name = ext_str(a.get("file_name"), "file_name").strip()
-                                    if a.get("is_animated") or not ext_str(a.get("url"), "url").strip():
-                                        content = guidance.animated_sticker_injection(name)
-                                    else:
-                                        content = guidance.sticker_injection(name or "a sticker", "", "")
-                                    break
-                        body = {
-                            "method": "send_message",
-                            "params": {"text": content},
-                            "text": content,
-                            "caption": "",
-                            "attachments": attachments,
-                            "msg_id": msg_id,
-                            "platform": "discord",
-                            "user_id": author_id or "",
-                        }
-                        sender_name, sender_username = _discord_author_sender(author)
-                        apply_sender(body, name=sender_name, username=sender_username)
-                        if reply_to:
-                            body["reply_to"] = reply_to
-                        if reply_to_text:
-                            body["reply_to_text"] = reply_to_text
-                        if chat_type:
-                            body["chat_type"] = chat_type
-                        ref_author = ""
-                        referenced = m.get("referenced_message")
-                        if referenced is not None:
-                            referenced = ext_dict("discord referenced_message", referenced)
-                            ref_user = referenced.get("author")
-                            if ref_user is not None:
-                                ref_user = ext_dict("discord referenced author", ref_user)
-                                ref_author = ext_id(ref_user.get("id"), "id").strip()
-                        body["mentioned"] = discord_mentions_bot(
-                            bot_id=self_id,
-                            content=ext_str(m.get("content"), "content"),
-                            mention_ids=_discord_mention_ids_from_users(m.get("mentions")),
-                            referenced_author_id=ref_author,
-                        )
-                        if not content and not attachments:
-                            body["raw"] = m
-                        ok = await self.conductor.deliver_inbound(
-                            model_id=model_id,
+                        meta = self._thread_lookup_meta(st, channel_meta, channel_meta.get(channel_id) or {})
+                        result = await self._accept_dsb_message(
                             acct_id=acct_id,
-                            chat_id=chat_id,
-                            request_id=msg_id,
-                            body=body,
+                            st=st,
+                            channel_id=channel_id,
+                            message=m,
+                            channel_meta=meta,
                         )
-                        if not ok:
+                        if result == "stop":
                             break
-                        cursors[channel_id] = msg_id
-                        state_dirty = True
+                        if result == "advance":
+                            state_dirty = True
 
                 if state_dirty:
                     await self._save_runtime_state(acct_id, mode="dsb")

@@ -163,10 +163,11 @@ class PairManager:
             "last_error_kind": ("pair_" + status) if error else "",
             "last_error_message": (error[:1024] if error else ""),
         }
-        body = await self.lc._consul_post_full(
-            path="/api/local_conductor/account_link/complete",
-            payload=payload,
-        )
+        async with self.lc.consul_write(acct_id):
+            body = await self.lc._consul_post_full(
+                path="/api/local_conductor/account_link/complete",
+                payload=payload,
+            )
         result = body.get("result")
         if result != 0:
             msg = body.get("msg")

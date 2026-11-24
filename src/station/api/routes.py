@@ -5,6 +5,18 @@ from .token import handle_admin_update_prototype_token, handle_admin_add_prototy
 from .reload import handle_admin_reload_config
 from .memory_admin import handle_admin_memory
 from .voice_inject import handle_admin_inject_voice_pcm
+from .admin_console import (
+    handle_admin_overview,
+    handle_admin_pause_model,
+    handle_admin_remove_model,
+    handle_admin_resume_model,
+    handle_admin_rewind_model,
+    handle_admin_start_model,
+    handle_admin_stop_model,
+)
+from .admin_config import handle_admin_get_config, handle_admin_set_config
+from .admin_commands import handle_admin_rekey, handle_admin_sync_tokens
+from .admin_logs import handle_admin_logs
 from station import hopmetrics
 from .model import (
     handle_reload_model,
@@ -37,8 +49,20 @@ class Routes:
         app.router.add_post("/station/pause_model/{model_id}", handle_pause_model)
         app.router.add_post("/station/resume_model/{model_id}", handle_resume_model)
         app.router.add_post("/station/rewind_model/{model_id}", handle_rewind_model)
+        app.router.add_get("/admin/overview", handle_admin_overview)
+        app.router.add_get("/admin/config", handle_admin_get_config)
+        app.router.add_post("/admin/config", handle_admin_set_config)
+        app.router.add_get("/admin/logs", handle_admin_logs)
+        app.router.add_post("/admin/sync_tokens", handle_admin_sync_tokens)
+        app.router.add_post("/admin/rekey", handle_admin_rekey)
         app.router.add_post("/admin/prototype_token", handle_admin_update_prototype_token)
         app.router.add_post("/admin/prototype", handle_admin_add_prototype)
         app.router.add_post("/admin/reload_config", handle_admin_reload_config)
+        app.router.add_post("/admin/model/start/{model_id}", handle_admin_start_model)
+        app.router.add_post("/admin/model/stop/{model_id}", handle_admin_stop_model)
+        app.router.add_post("/admin/model/pause/{model_id}", handle_admin_pause_model)
+        app.router.add_post("/admin/model/resume/{model_id}", handle_admin_resume_model)
+        app.router.add_post("/admin/model/rewind/{model_id}", handle_admin_rewind_model)
+        app.router.add_post("/admin/model/remove/{model_id}", handle_admin_remove_model)
         app.router.add_post("/admin/memory/{model_id}", handle_admin_memory)
         app.router.add_post("/admin/inject_voice_pcm", handle_admin_inject_voice_pcm)

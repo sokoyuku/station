@@ -19,13 +19,16 @@ class PrototypeGateway:
         await super()._start_body()
 
     async def stop(self):
+        await self._quiesce()
         await self._teardown_gateway()
         await super().stop()
 
     async def reload(self, model_settings=None):
         await super().reload(model_settings=model_settings)
+        await self._quiesce()
         await self._teardown_gateway()
         await self._ensure_gateway()
+        await self._restore_availability()
 
     async def _restart_gateway(self):
         await self._teardown_gateway()

@@ -1,6 +1,6 @@
 from station.client.conductor import send_proxy, send_outbound
 from station.errors import ExternalError, InternalError, public_chat_error
-from station.prototypes.chat_history import clear_chat_history
+from station.prototypes.chat_history import clear_chat_history, list_started_chats
 from station.prototypes.attachments import (
     PrototypeAttachments,
     find_attachment,
@@ -14,12 +14,17 @@ from station.prototypes.boundary import (
 )
 from .cli_tools import PrototypeCli
 from .commands import PrototypeCommands
+from .typing_indicator import TypingWhile
 from .echo import PrototypeEcho
 from .pfs import PrototypeFS
 from .webrtc import PrototypeWebRTC
 from .discord_voice import PrototypeDiscordVoice
 from .inbound import InboundMessageContext, PrototypeInbound
 from station import logger
+
+UNAVAILABLE_TEXT = "This prototype is currently unavailable."
+RESTORED_TEXT = "This prototype is restored."
+
 
 class Prototype(PrototypeCli, PrototypeCommands, PrototypeEcho, PrototypeWebRTC, PrototypeDiscordVoice, PrototypeAttachments, PrototypeOutboundFiles, PrototypeFS, PrototypeInbound):
     def __init__(
@@ -108,6 +113,9 @@ class Prototype(PrototypeCli, PrototypeCommands, PrototypeEcho, PrototypeWebRTC,
             return ctx.token
         return self.prototype_config.token
 
+    def typing_while(self, *, chat_id, acct_id):
+        return TypingWhile(self, chat_id=chat_id, acct_id=acct_id)
+
     async def send_proxy(self, method="send_message", params=None, files=None, chat_id=None, acct_id=None, **kwargs):
         return await send_proxy(
             self.client_context,
@@ -151,6 +159,71 @@ class Prototype(PrototypeCli, PrototypeCommands, PrototypeEcho, PrototypeWebRTC,
             chat_type=chat_type,
             keyboard=keyboard,
         )
+
+    def _known_chats(self):
+        return list_started_chats(self.storage_dir)
+
+    async def _halt_sessions(self):
+        return
+
+    async def _resume_sessions(self):
+        return
+
+    async def _notify_known_chats(self, text):
+        for chat in self._known_chats():
+            acct_id = chat.get("acct_id") or ""
+            chat_id = chat.get("chat_id") or ""
+            if not acct_id or not chat_id:
+                continue
+            try:
+                await self.send_outbound(
+                    text=text,
+                    chat_id=chat_id,
+                    acct_id=acct_id,
+                    platform=chat.get("platform") or "",
+                    chat_type=chat.get("chat_type") or "",
+                )
+            except Exception as e:
+                logger.error(
+                    "availability notice failed model_id=%s acct_id=%s chat_id=%s error=%s",
+                    self.model_id,
+                    acct_id,
+                    chat_id,
+                    e,
+                    exc_info=e,
+                )
+
+    async def _quiesce(self):
+        if getattr(self, "_availability_down", False):
+            return
+        self._availability_down = True
+        self._availability_restored = False
+        try:
+            await self._halt_sessions()
+        except Exception as e:
+            logger.error(
+                "halt sessions failed model_id=%s error=%s",
+                self.model_id,
+                e,
+                exc_info=e,
+            )
+        await self._notify_known_chats(UNAVAILABLE_TEXT)
+
+    async def _restore_availability(self):
+        if getattr(self, "_availability_restored", False):
+            return
+        self._availability_restored = True
+        self._availability_down = False
+        await self._notify_known_chats(RESTORED_TEXT)
+        try:
+            await self._resume_sessions()
+        except Exception as e:
+            logger.error(
+                "resume sessions failed model_id=%s error=%s",
+                self.model_id,
+                e,
+                exc_info=e,
+            )
 
     def _message_attachments(self, data):
         return normalize_attachments(data.get("attachments"))

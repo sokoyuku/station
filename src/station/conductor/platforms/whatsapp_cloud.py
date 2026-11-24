@@ -795,15 +795,17 @@ class WhatsAppCloudIO:
                         )
                     )
                     if not model_id:
-                        model_id = await self.conductor.ensure_chat_mapping(
+                        mapped = await self.conductor.ensure_chat_mapping(
                             acct_id=acct_id,
                             chat_id=parsed["chat_id"],
                             chat_type="whatsapp_cloud",
                             carrier_user_id=parsed["carrier_user_id"],
                             force=force,
                         )
+                        model_id = mapped.model_id
                     if not model_id:
-                        delivery_failed = True
+                        if not mapped.settled:
+                            delivery_failed = True
                         continue
                     body = {
                         "method": "send_message",

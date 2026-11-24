@@ -23,6 +23,7 @@ async def _timestamptz(conn, table, column):
         f"ALTER TABLE {table} ALTER COLUMN {column} TYPE TIMESTAMPTZ "
         f"USING CASE WHEN {column} IS NULL THEN NULL ELSE to_timestamp({column}) END"
     )
+from station.conductor.otp import apply_verify, expiry_text, fresh_otp, reusable
 from station.conductor.platform_types import strip_qr_prefix, validate_local_platform_type
 from station.database import AsyncDatabase
 from station.database.request_dedupe import shared_dedupe_cache
@@ -200,10 +201,20 @@ class PostgresDatabase(AsyncDatabase):
                         version INTEGER,
                         account_id TEXT,
                         accts TEXT,
-                        created_at TIMESTAMPTZ
+                        created_at TIMESTAMPTZ,
+                        chat_version INTEGER NOT NULL DEFAULT 0
                     )
                     """
                 )
+                has_chat_version = await conn.fetchval(
+                    """
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_name = 'models' AND column_name = 'chat_version'
+                    """
+                )
+                if not has_chat_version:
+                    await conn.execute("ALTER TABLE models ADD COLUMN chat_version INTEGER NOT NULL DEFAULT 0")
+                    await conn.execute("UPDATE models SET version = 0")
                 await conn.execute("DROP TABLE IF EXISTS requests CASCADE")
                 await conn.execute(
                     """
@@ -288,6 +299,28 @@ class PostgresDatabase(AsyncDatabase):
                     await conn.execute(
                         "CREATE INDEX IF NOT EXISTS idx_local_account_runtime_state_acct_id ON local_account_runtime_state(acct_id)"
                     )
+                    await conn.execute(
+                        """
+                        CREATE TABLE IF NOT EXISTS local_chat_opened (
+                            acct_id TEXT NOT NULL,
+                            chat_id TEXT NOT NULL,
+                            model_id TEXT NOT NULL,
+                            PRIMARY KEY (acct_id, chat_id)
+                        )
+                        """
+                    )
+                    await conn.execute(
+                        """
+                        CREATE TABLE IF NOT EXISTS local_otps (
+                            model_id TEXT NOT NULL,
+                            acct_id TEXT NOT NULL,
+                            otp TEXT NOT NULL,
+                            expires_at TEXT NOT NULL,
+                            attempts INTEGER NOT NULL,
+                            PRIMARY KEY (model_id, acct_id)
+                        )
+                        """
+                    )
                 for table, column in (
                     ("models", "created_at"),
                     ("inbound_pending", "created_at"),
@@ -305,6 +338,7 @@ class PostgresDatabase(AsyncDatabase):
 
     async def wipe_all(self) -> None:
         tables = (
+            "local_otps",
             "local_account_runtime_state",
             "local_chats",
             "local_accounts",
@@ -326,7 +360,6 @@ class PostgresDatabase(AsyncDatabase):
         settings_obj = data.get("settings")
         if settings_obj is None:
             settings_obj = {}
-        version = data.get("version", 1)
         account_id = data.get("account_id")
         if account_id is None:
             account_id = ""
@@ -335,11 +368,21 @@ class PostgresDatabase(AsyncDatabase):
             accts_obj = []
 
         async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT version, chat_version FROM models WHERE model_id = $1",
+                model_id,
+            )
+            version = data.get("version")
+            if version is None:
+                version = row["version"] if row is not None and row["version"] is not None else 0
+            chat_version = data.get("chat_version")
+            if chat_version is None:
+                chat_version = row["chat_version"] if row is not None and row["chat_version"] is not None else 0
             await conn.execute(
                 """
                 INSERT INTO models
-                (model_id, prototype_id, conductor_addr, settings, version, account_id, accts, created_at)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                (model_id, prototype_id, conductor_addr, settings, version, account_id, accts, created_at, chat_version)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
                 ON CONFLICT (model_id) DO UPDATE SET
                     prototype_id = EXCLUDED.prototype_id,
                     conductor_addr = EXCLUDED.conductor_addr,
@@ -347,7 +390,8 @@ class PostgresDatabase(AsyncDatabase):
                     version = EXCLUDED.version,
                     account_id = EXCLUDED.account_id,
                     accts = EXCLUDED.accts,
-                    created_at = EXCLUDED.created_at
+                    created_at = EXCLUDED.created_at,
+                    chat_version = EXCLUDED.chat_version
                 """,
                 model_id,
                 prototype_id,
@@ -357,13 +401,14 @@ class PostgresDatabase(AsyncDatabase):
                 account_id,
                 json.dumps(accts_obj),
                 instant.now(),
+                chat_version,
             )
 
     async def get_model(self, model_id: str) -> dict | None:
         async with self.pool.acquire() as conn:
             row = await conn.fetchrow(
                 """
-                SELECT model_id, prototype_id, conductor_addr, settings, version, account_id, accts, created_at
+                SELECT model_id, prototype_id, conductor_addr, settings, version, account_id, accts, created_at, chat_version
                 FROM models
                 WHERE model_id = $1
                 """,
@@ -382,13 +427,14 @@ class PostgresDatabase(AsyncDatabase):
             "account_id": row["account_id"],
             "accts": accts,
             "created_at": instant.format(row["created_at"]),
+            "chat_version": row["chat_version"],
         }
 
     async def list_models(self) -> list[dict]:
         async with self.pool.acquire() as conn:
             rows = await conn.fetch(
                 """
-                SELECT model_id, prototype_id, conductor_addr, settings, version, account_id, accts, created_at
+                SELECT model_id, prototype_id, conductor_addr, settings, version, account_id, accts, created_at, chat_version
                 FROM models
                 """
             )
@@ -402,11 +448,20 @@ class PostgresDatabase(AsyncDatabase):
                 "conductor_address": row["conductor_addr"],
                 "settings": settings,
                 "version": row["version"],
+                "chat_version": row["chat_version"],
                 "account_id": row["account_id"],
                 "accts": accts,
                 "created_at": instant.format(row["created_at"]),
             })
         return out
+
+    async def set_model_chat_version(self, model_id: str, chat_version: int) -> None:
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE models SET chat_version = $1 WHERE model_id = $2",
+                chat_version,
+                model_id,
+            )
 
     async def update_model_secrets(self, model_id: str, *, settings, accts) -> None:
         async with self.pool.acquire() as conn:
@@ -674,7 +729,9 @@ class PostgresDatabase(AsyncDatabase):
                     """,
                     model_id,
                 )
+                await conn.execute("DELETE FROM local_otps WHERE model_id = $1", model_id)
                 await conn.execute("DELETE FROM local_chats WHERE model_id = $1", model_id)
+                await conn.execute("DELETE FROM local_chat_opened WHERE model_id = $1", model_id)
                 await conn.execute("DELETE FROM local_accounts WHERE model_id = $1", model_id)
 
     async def upsert_local_account(
@@ -782,9 +839,78 @@ class PostgresDatabase(AsyncDatabase):
             return
         async with self.pool.acquire() as conn:
             async with conn.transaction():
+                await conn.execute("DELETE FROM local_otps WHERE acct_id = $1", acct_id)
                 await conn.execute("DELETE FROM local_account_runtime_state WHERE acct_id = $1", acct_id)
                 await conn.execute("DELETE FROM local_chats WHERE acct_id = $1", acct_id)
+                await conn.execute("DELETE FROM local_chat_opened WHERE acct_id = $1", acct_id)
                 await conn.execute("DELETE FROM local_accounts WHERE acct_id = $1", acct_id)
+
+    async def generate_local_otp(self, model_id: str, acct_id: str) -> str:
+        model_id = (model_id or "").strip()
+        acct_id = (acct_id or "").strip()
+        if not model_id or not acct_id:
+            raise ExternalError("model_id and acct_id are required")
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                row = await conn.fetchrow(
+                    "SELECT otp, expires_at, attempts FROM local_otps WHERE model_id = $1 AND acct_id = $2 FOR UPDATE",
+                    model_id,
+                    acct_id,
+                )
+                existing = None
+                if row:
+                    existing = {"otp": row["otp"], "expires_at": row["expires_at"], "attempts": row["attempts"]}
+                kept = reusable(existing)
+                if kept:
+                    return kept
+                otp = fresh_otp()
+                await conn.execute(
+                    """
+                    INSERT INTO local_otps (model_id, acct_id, otp, expires_at, attempts)
+                    VALUES ($1, $2, $3, $4, 0)
+                    ON CONFLICT (model_id, acct_id) DO UPDATE SET
+                        otp = EXCLUDED.otp,
+                        expires_at = EXCLUDED.expires_at,
+                        attempts = 0
+                    """,
+                    model_id,
+                    acct_id,
+                    otp,
+                    expiry_text(),
+                )
+                return otp
+
+    async def verify_local_otp(self, model_id: str, acct_id: str, token: str) -> bool:
+        model_id = (model_id or "").strip()
+        acct_id = (acct_id or "").strip()
+        token = "" if token is None else str(token)
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                row = await conn.fetchrow(
+                    "SELECT otp, expires_at, attempts FROM local_otps WHERE model_id = $1 AND acct_id = $2 FOR UPDATE",
+                    model_id,
+                    acct_id,
+                )
+                if not row:
+                    return False
+                valid, replacement = apply_verify(
+                    {"otp": row["otp"], "expires_at": row["expires_at"], "attempts": row["attempts"]},
+                    token,
+                )
+                if replacement is None:
+                    await conn.execute(
+                        "DELETE FROM local_otps WHERE model_id = $1 AND acct_id = $2",
+                        model_id,
+                        acct_id,
+                    )
+                else:
+                    await conn.execute(
+                        "UPDATE local_otps SET attempts = $1 WHERE model_id = $2 AND acct_id = $3",
+                        replacement["attempts"],
+                        model_id,
+                        acct_id,
+                    )
+                return valid
 
     async def replace_model_chats(self, *, model_id: str, prototype_id: int | None, chats: list[dict]) -> None:
         if not model_id:
@@ -792,7 +918,13 @@ class PostgresDatabase(AsyncDatabase):
         now = instant.now()
         async with self.pool.acquire() as conn:
             async with conn.transaction():
+                opened_rows = await conn.fetch(
+                    "SELECT acct_id, chat_id FROM local_chat_opened WHERE model_id = $1",
+                    model_id,
+                )
                 await conn.execute("DELETE FROM local_chats WHERE model_id = $1", model_id)
+                await conn.execute("DELETE FROM local_chat_opened WHERE model_id = $1", model_id)
+                kept = set()
                 for c in chats or []:
                     acct_id = c.get("acct_id") or ""
                     chat_id = c.get("chat_id") or ""
@@ -820,6 +952,17 @@ class PostgresDatabase(AsyncDatabase):
                         ),
                         c.get("carrier_user_id") or None,
                         now,
+                    )
+                    kept.add((acct_id, chat_id))
+                for row in opened_rows:
+                    pair = (row["acct_id"], row["chat_id"])
+                    if pair not in kept:
+                        continue
+                    await conn.execute(
+                        "INSERT INTO local_chat_opened (acct_id, chat_id, model_id) VALUES ($1, $2, $3)",
+                        pair[0],
+                        pair[1],
+                        model_id,
                     )
 
     async def upsert_local_chat(
@@ -912,13 +1055,53 @@ class PostgresDatabase(AsyncDatabase):
         if not model_id or not chat_id or not acct_id:
             return False
         async with self.pool.acquire() as conn:
-            await conn.execute(
-                "DELETE FROM local_chats WHERE model_id = $1 AND chat_id = $2 AND acct_id = $3",
-                model_id,
-                chat_id,
-                acct_id,
-            )
+            async with conn.transaction():
+                await conn.execute(
+                    "DELETE FROM local_chats WHERE model_id = $1 AND chat_id = $2 AND acct_id = $3",
+                    model_id,
+                    chat_id,
+                    acct_id,
+                )
+                await conn.execute(
+                    "DELETE FROM local_chat_opened WHERE acct_id = $1 AND chat_id = $2",
+                    acct_id,
+                    chat_id,
+                )
         return True
+
+    async def mark_local_chat_opened(self, *, acct_id: str, chat_id: str, model_id: str) -> None:
+        acct_id = (acct_id or "").strip()
+        chat_id = (chat_id or "").strip()
+        model_id = (model_id or "").strip()
+        if not (acct_id and chat_id and model_id):
+            return
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO local_chat_opened (acct_id, chat_id, model_id)
+                VALUES ($1, $2, $3)
+                ON CONFLICT (acct_id, chat_id) DO UPDATE SET model_id = EXCLUDED.model_id
+                """,
+                acct_id,
+                chat_id,
+                model_id,
+            )
+
+    async def local_chat_opened(self, *, acct_id: str, chat_id: str, model_id: str) -> bool:
+        acct_id = (acct_id or "").strip()
+        chat_id = (chat_id or "").strip()
+        want = (model_id or "").replace("-", "").strip().lower()
+        if not (acct_id and chat_id and want):
+            return False
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT model_id FROM local_chat_opened WHERE acct_id = $1 AND chat_id = $2",
+                acct_id,
+                chat_id,
+            )
+        if not row:
+            return False
+        return (row["model_id"] or "").replace("-", "").strip().lower() == want
 
     async def get_local_account_runtime_state(
         self,

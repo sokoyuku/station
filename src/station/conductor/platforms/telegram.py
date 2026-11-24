@@ -740,7 +740,7 @@ class TelegramIO:
             sender_username=sender_username,
         )
 
-    async def _get_updates(self, *, token: str, offset: int) -> list[dict] | None:
+    async def _get_updates(self, *, token: str, offset: int, acct_id: str = "") -> list[dict] | None:
         await self._ensure_network_ready()
         url = f"{self._api_base()}/bot{token}/getUpdates"
         params = {"timeout": 25, "offset": offset, "allowed_updates": _TELEGRAM_ALLOWED_UPDATES}
@@ -758,7 +758,7 @@ class TelegramIO:
         if not body.get("ok"):
             desc = ext_str(body.get("description"), "description")
             if status == 409 or ("conflict" in desc.lower() and "getupdates" in desc.lower()):
-                await self._recover_polling_conflict(token=token, description=desc)
+                await self._recover_polling_conflict(token=token, description=desc, acct_id=acct_id)
             return None
         result = body.get("result")
         result = ext_list('telegram getUpdates result', result)
@@ -769,9 +769,14 @@ class TelegramIO:
             out.append(u)
         return out
 
-    async def _recover_polling_conflict(self, *, token: str, description: str = "") -> None:
+    async def _recover_polling_conflict(self, *, token: str, description: str = "", acct_id: str = "") -> None:
         self._conflict_count += 1
         count = self._conflict_count
+        if count == 1 and acct_id and hasattr(self.conductor, "refresh_suspect_account"):
+            try:
+                await self.conductor.refresh_suspect_account(acct_id)
+            except Exception as e:
+                logger.error("unexpected where=telegram_consul_refresh acct_id=%s error=%s", acct_id, e, exc_info=e)
         max_retries = 5
         delay = min(60.0, 10.0 + count * 10.0)
         logger.warning(
@@ -1262,15 +1267,16 @@ class TelegramIO:
         open_id = open_telegram_chat_id(parsed.chat_id)
         model_id = None if force else (await self.conductor.db.lookup_model_for_chat(acct_id=acct_id, chat_id=open_id))
         if not model_id:
-            model_id = await self.conductor.ensure_chat_mapping(
+            mapped = await self.conductor.ensure_chat_mapping(
                 acct_id=acct_id,
                 chat_id=open_id,
                 chat_type="telegram",
                 carrier_user_id=parsed.carrier_user_id,
                 force=force,
             )
+            model_id = mapped.model_id
         if not model_id:
-            return False
+            return mapped.settled
         body = {
             "method": "send_message",
             "params": {"text": parsed.text},
@@ -1352,7 +1358,7 @@ class TelegramIO:
                     await asyncio.sleep(2)
                     continue
                 offset = await self._get_update_offset(acct_id)
-                updates = await self._get_updates(token=token, offset=offset)
+                updates = await self._get_updates(token=token, offset=offset, acct_id=acct_id)
                 if updates is None:
                     await asyncio.sleep(1)
                     continue

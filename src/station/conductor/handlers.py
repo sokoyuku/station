@@ -1,4 +1,5 @@
 import asyncio
+from contextlib import asynccontextmanager
 import json
 import os
 from typing import Any
@@ -12,7 +13,7 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from station.api.http import ext_path_int, read_json_object
 from station.client.consul import CONSUL_TIMEOUT, fetch_prototype
 from station.client.retry import RetryableError, is_retryable_error, is_transient_status, retry_transient
-from station.database.consul_state import apply_consul_model, apply_consul_prototype
+from station.database.consul_state import apply_consul_model, apply_consul_prototype, version_is_stale
 from station.api.reception import is_slash_command
 from station.conductor.account_status import AccountUnreachable, check_local_account
 from station.conductor.crypto import default_private_key_path, decrypt_if_encrypted, load_private_key, public_key_token, write_private_key
@@ -24,6 +25,7 @@ from station.conductor.platform_types import (
 from station.conductor.platforms import LocalPlatformAdapter, build_builtin_platforms
 from station.conductor.platforms.chat_type import station_chat_type
 from station.conductor.platforms.group_settings import controls_group_messages, ensure_group_notice
+from station.conductor.otp import classify_start_arg, start_otp_token
 from station.conductor.pair import PairManager
 from station.conductor.util import constant_time_equal, err, ext_bool, ext_int, ext_str, normalize_http_url, ok, catch_external
 from station.errors import ExternalError
@@ -51,6 +53,20 @@ _MEDIA_METHODS = {
     "send_sticker",
 }
 
+_SUPPORT_NOTE = " You can reach this prototype's support for support. It is shown in the prototype details."
+_MODEL_UNAVAILABLE = "This model isn't available. Please check the model and try again."
+_COULD_NOT_REACH = "Couldn't reach the model. Please send your message again to retry."
+_MODEL_INTERNAL = "The model had an internal error. Please send your message again to retry." + _SUPPORT_NOTE
+_MODEL_BUSY = "This model is busy right now. Please send your message again to retry."
+_MAX_CHATS = "Max chats reached."
+_ADD_CHAT_ERROR = "Error adding chat."
+
+
+class ChatMapping:
+    def __init__(self, model_id: str = "", settled: bool = False):
+        self.model_id = model_id or ""
+        self.settled = settled
+
 class LocalConductor:
     def __init__(self, app: web.Application):
         self.app = app
@@ -77,6 +93,7 @@ class LocalConductor:
         self.platforms: dict[str, LocalPlatformAdapter] = build_builtin_platforms(self)
         self.pair_manager = PairManager(self)
         self._user_sync_lock = asyncio.Lock()
+        self._consul_write_holds: dict[str, int] = {}
 
     def require_own_prototype(self, prototype_id: int) -> web.Response | None:
         registry = self.app["tenants"]
@@ -101,6 +118,71 @@ class LocalConductor:
         host = self.config.host.strip() if self.config.host else "127.0.0.1"
         port = self.config.port if self.config.port is not None else 0
         return f"http://{host}:{port}".rstrip("/")
+
+    def _consul_write_held(self, key) -> bool:
+        return _norm_acct(key) in self._consul_write_holds
+
+    @asynccontextmanager
+    async def consul_write(self, *keys):
+        held = []
+        for key in keys:
+            norm = _norm_acct(key)
+            if not norm:
+                continue
+            self._consul_write_holds[norm] = self._consul_write_holds.get(norm, 0) + 1
+            held.append(norm)
+        try:
+            yield
+        finally:
+            for norm in held:
+                left = self._consul_write_holds.get(norm, 0) - 1
+                if left <= 0:
+                    self._consul_write_holds.pop(norm, None)
+                else:
+                    self._consul_write_holds[norm] = left
+
+    def _model_assigned_here(self, remote: dict) -> bool:
+        addr = normalize_http_url(str(remote.get("conductor_address") or ""))
+        if not addr:
+            return True
+        return addr == normalize_http_url(self.conductor_address())
+
+    def _stop_account_poller(self, acct_id: str) -> None:
+        raw = str(acct_id or "").strip()
+        if not raw:
+            return
+        for key in {raw, raw.replace("-", "")}:
+            task = self._poller_tasks.pop(key, None)
+            self._poller_task_types.pop(key, None)
+            if task is not None:
+                task.cancel()
+
+    async def refresh_suspect_account(self, acct_id: str) -> None:
+        acct_id = str(acct_id or "").strip()
+        if not acct_id or self._consul_write_held(acct_id):
+            return
+        acct = await self.db.get_local_account(acct_id)
+        if acct is None:
+            compact = acct_id.replace("-", "")
+            if compact != acct_id:
+                acct = await self.db.get_local_account(compact)
+        if not acct:
+            return
+        model_id = str(acct.get("model_id") or "").strip()
+        if not model_id or self._consul_write_held(model_id):
+            return
+        try:
+            await self._reconcile_model_from_consul(
+                model_id=model_id,
+                prototype_id=acct.get("prototype_id"),
+                respect_write_hold=True,
+            )
+        except ExternalError as exc:
+            if exc.status == 404 and not self._consul_write_held(acct_id) and not self._consul_write_held(model_id):
+                logger.info("consul model missing model_id=%s; dropping local", model_id)
+                await self._remove_local_model(model_id)
+                return
+            logger.error("consul refresh failed acct_id=%s model_id=%s error=%s", acct_id, model_id, exc)
 
     def get_platform(self, acct_type: str | None) -> LocalPlatformAdapter | None:
         normalized = strip_qr_prefix(acct_type)
@@ -217,10 +299,10 @@ class LocalConductor:
                     try:
                         parsed = json.loads(raw_content)
                     except (json.JSONDecodeError, ValueError):
-                        raise ExternalError("Invalid webrtc_content")
+                        raise ExternalError("Invalid webrtc_content", code="conductor.local.gateway.webrtc_content_json")
                     content_obj = ext_dict("webrtc_content", parsed)
                 else:
-                    raise ExternalError("Invalid webrtc_content")
+                    raise ExternalError("Invalid webrtc_content", code="conductor.local.gateway.webrtc_content_type")
                 if not webrtc_type:
                     return err("Missing webrtc_type", status=400)
                 ok_ = await adapter.send_webrtc(
@@ -316,13 +398,27 @@ class LocalConductor:
     async def _prototype_version_ok(self, request: web.Request, prototype_id: int) -> bool:
         raw = request.headers.get("X-Prototype-Version")
         if raw is None or raw == "":
-            logger.error("prototype version missing prototype_id=%s", prototype_id)
-            raise ExternalError("Synchronize from consul", status=490, retryable=True)
+            logger.error("prototype version missing prototype_id=%s code=conductor.local.prototype.version_header_missing", prototype_id)
+            raise ExternalError(
+                "Synchronize from consul",
+                status=490,
+                retryable=True,
+                code="conductor.local.prototype.version_header_missing",
+            )
         try:
             incoming = ext_path_int("X-Prototype-Version", raw)
         except ExternalError as e:
-            logger.error("prototype version invalid prototype_id=%s error=%s", prototype_id, e)
-            raise ExternalError("Synchronize from consul", status=490, retryable=True) from e
+            logger.error(
+                "prototype version invalid prototype_id=%s code=conductor.local.prototype.version_header_invalid error=%s",
+                prototype_id,
+                e,
+            )
+            raise ExternalError(
+                "Synchronize from consul",
+                status=490,
+                retryable=True,
+                code="conductor.local.prototype.version_header_invalid",
+            ) from e
         stored = (await self.db.get_prototype_info(prototype_id)) if prototype_id else None
         local = 0
         if stored is not None:
@@ -337,7 +433,12 @@ class LocalConductor:
         if local == incoming:
             return True
         if tenant is None:
-            raise ExternalError("Synchronize from consul", status=490, retryable=True)
+            raise ExternalError(
+                "Synchronize from consul",
+                status=490,
+                retryable=True,
+                code="conductor.local.prototype.tenant_missing",
+            )
         token = tenant.token_state.token
         fetched = await fetch_prototype(
             session=self.session,
@@ -350,14 +451,82 @@ class LocalConductor:
         else:
             local = ext_int(fetched.get("version"), "version")
         if local != incoming:
-            raise ExternalError("Synchronize from consul", status=490, retryable=True)
+            raise ExternalError(
+                "Synchronize from consul",
+                status=490,
+                retryable=True,
+                code="conductor.local.prototype.version_mismatch",
+            )
+        return True
+
+    async def _model_versions_ok(self, request: web.Request, model_id: str) -> bool:
+        raw_model = request.headers.get("X-Model-Version")
+        raw_chat = request.headers.get("X-Chat-Version")
+        if not raw_model or not raw_chat:
+            logger.error("model version missing model_id=%s code=conductor.local.model.version_header_missing", model_id)
+            raise ExternalError(
+                "Synchronize from consul",
+                status=490,
+                retryable=True,
+                code="conductor.local.model.version_header_missing",
+            )
+        try:
+            incoming_model = ext_path_int("X-Model-Version", raw_model)
+            incoming_chat = ext_path_int("X-Chat-Version", raw_chat)
+        except ExternalError as e:
+            logger.error("model version invalid model_id=%s code=conductor.local.model.version_header_invalid error=%s", model_id, e)
+            raise ExternalError(
+                "Synchronize from consul",
+                status=490,
+                retryable=True,
+                code="conductor.local.model.version_header_invalid",
+            ) from e
+        local = await self.db.get_model(model_id)
+        local_model = int((local or {}).get("version") or 0)
+        local_chat = int((local or {}).get("chat_version") or 0)
+        if local_model >= incoming_model and local_chat >= incoming_chat:
+            return True
+        if local_model < incoming_model or local_chat < incoming_chat:
+            remote = await self.fetch_model_from_consul(model_id=model_id)
+            remote_settings = self._decrypt_model_settings(remote.get("settings"))
+            if remote_settings is None:
+                raise ExternalError("Model settings decrypt failed", status=500)
+            remote = dict(remote)
+            remote["settings"] = remote_settings
+            if not self._model_version_stale(local, remote):
+                await apply_consul_model(self.db, model_id, remote)
+            chats, chat_version = await self.fetch_model_chats_from_consul(model_id=model_id)
+            prototype_id = remote.get("prototype_id")
+            if prototype_id is not None:
+                prototype_id = ext_int(prototype_id, "prototype_id")
+            await self._apply_chats_if_current(
+                model_id=model_id,
+                prototype_id=prototype_id,
+                chats=chats,
+                chat_version=chat_version,
+            )
+            local = await self.db.get_model(model_id)
+            local_model = int((local or {}).get("version") or 0)
+            local_chat = int((local or {}).get("chat_version") or 0)
+        if local_model < incoming_model or local_chat < incoming_chat:
+            raise ExternalError(
+                "Synchronize from consul",
+                status=490,
+                retryable=True,
+                code="conductor.local.model.version_mismatch",
+            )
         return True
 
     async def _consul_request(self, *, method: str, path: str, payload: dict | None = None, prototype_token: str | None = None) -> dict:
         consul_url = self.config.consul_url.rstrip("/") if self.config.consul_url else ""
         if not consul_url:
-            logger.error("consul request missing url path=%s", path)
-            raise ExternalError("CONSUL_URL is required", status=500, reason="consul_unavailable")
+            logger.error("consul request missing url path=%s code=conductor.local.consul.url_missing", path)
+            raise ExternalError(
+                "CONSUL_URL is required",
+                status=500,
+                reason="consul_unavailable",
+                code="conductor.local.consul.url_missing",
+            )
         url = "%s%s" % (consul_url, path)
         headers = {"Content-Type": "application/json"}
         if self.public_key_token:
@@ -369,19 +538,41 @@ class LocalConductor:
                 try:
                     body = await resp.json(content_type=None)
                 except (aiohttp.ContentTypeError, json.JSONDecodeError, ValueError) as e:
-                    raise RetryableError(
-                        "consul invalid json path=%s status=%s error=%s" % (path, resp.status, e)
+                    raise ExternalError(
+                        "consul invalid json path=%s status=%s" % (path, resp.status),
+                        status=502,
+                        reason="consul_invalid_json",
+                        code="conductor.local.consul.invalid_json",
+                        retryable=False,
                     ) from e
                 if is_transient_status(resp.status):
                     raise RetryableError("consul status=%s path=%s" % (resp.status, path))
                 if resp.status != 200:
-                    logger.error("consul request failed path=%s status=%s body=%s", path, resp.status, body)
-                    status = 404 if resp.status == 404 else (401 if resp.status == 401 else 502)
-                    reason = "not_found" if resp.status == 404 else ("unauthorized" if resp.status == 401 else "consul_http")
+                    upstream_code = ""
+                    upstream_msg = ""
+                    if isinstance(body, dict):
+                        upstream_code = str(body.get("code") or "").strip()
+                        upstream_msg = str(body.get("msg") or "")
+                    logger.error(
+                        "consul request failed path=%s status=%s code=%s body=%s",
+                        path,
+                        resp.status,
+                        upstream_code,
+                        body,
+                    )
+                    if upstream_code:
+                        raise ExternalError(
+                            upstream_msg or ("consul request failed path=%s status=%s" % (path, resp.status)),
+                            status=resp.status,
+                            reason=upstream_code,
+                            code=upstream_code,
+                            retryable=False,
+                        )
                     raise ExternalError(
                         "consul request failed path=%s status=%s" % (path, resp.status),
-                        status=status,
-                        reason=reason,
+                        status=resp.status,
+                        reason="consul_http_%s" % resp.status,
+                        code="conductor.local.consul.http_%s" % resp.status,
                         retryable=False,
                     )
                 return ext_dict("consul body", body)
@@ -393,11 +584,12 @@ class LocalConductor:
         except Exception as e:
             if not is_retryable_error(e):
                 raise
-            logger.error("consul request retry exhausted path=%s error=%s", path, e)
+            logger.error("consul request retry exhausted path=%s code=conductor.local.consul.retry_exhausted error=%s", path, e)
             raise ExternalError(
                 "consul request failed path=%s error=%s" % (path, e),
                 status=502,
                 reason="consul_request",
+                code="conductor.local.consul.retry_exhausted",
                 retryable=True,
             ) from e
 
@@ -410,17 +602,28 @@ class LocalConductor:
         if result != 0:
             msg = body.get("msg")
             text = "consul %s result=%s msg=%s" % (path, result, msg)
-            logger.error("%s", text)
+            code = str(body.get("code") or "").strip()
+            if not code:
+                from station.errors import slug
+                code = "consul.unspecified.%s.%s" % (slug(path), slug(msg or "error"))
+            logger.error("%s code=%s", text, code)
             lowered = str(msg or "").lower()
-            if "not found" in lowered:
-                raise ExternalError(text, status=404, reason="not_found")
-            if "unauthorized" in lowered:
-                raise ExternalError(text, status=401, reason="unauthorized")
-            raise ExternalError(text, status=502, reason="consul_result")
+            if code.endswith(".model_not_found") or "model not found" in lowered:
+                status = 404
+            elif code.endswith(".unauthorized") or "unauthorized" in lowered:
+                status = 401
+            else:
+                status = 502
+            raise ExternalError(text, status=status, reason=code, code=code)
         data = body.get("data")
         if data is None:
-            logger.error("consul %s empty data", path)
-            raise ExternalError("consul %s empty data" % path, status=502, reason="consul_empty")
+            logger.error("consul %s empty data code=conductor.local.consul.empty_data", path)
+            raise ExternalError(
+                "consul %s empty data" % path,
+                status=502,
+                reason="consul_empty",
+                code="conductor.local.consul.empty_data",
+            )
         return ext_dict("consul data", data)
 
     async def _consul_post_full(self, *, path: str, payload: dict) -> dict:
@@ -429,8 +632,12 @@ class LocalConductor:
     async def fetch_model_from_consul(self, *, model_id: str) -> dict:
         return await self._consul_post(path="/api/local_conductor/get_model", payload={"model_id": model_id})
 
-    async def fetch_model_chats_from_consul(self, *, model_id: str) -> list[dict]:
+    async def fetch_model_chats_from_consul(self, *, model_id: str):
         data = await self._consul_post(path="/api/local_conductor/get_model_chats", payload={"model_id": model_id})
+        chat_version = ext_int(data.get("chat_version"), "chat_version")
+        if chat_version <= 0:
+            logger.error("consul chat_version invalid model_id=%s", model_id)
+            raise ExternalError("invalid chat_version", status=502)
         chats = data.get("chats")
         if chats is None:
             logger.error("consul chats missing model_id=%s", model_id)
@@ -440,7 +647,24 @@ class LocalConductor:
         for c in chats:
             c = ext_dict('chat', c)
             out.append(c)
-        return out
+        return out, chat_version
+
+    async def _apply_chats_if_current(self, *, model_id, prototype_id, chats, chat_version):
+        local = await self.db.get_model(model_id)
+        if version_is_stale(local, chat_version, "chat_version"):
+            logger.error(
+                "stale chat snapshot model_id=%s remote=%s local=%s",
+                model_id,
+                chat_version,
+                local.get("chat_version"),
+            )
+            return False
+        await self.db.replace_model_chats(model_id=model_id, prototype_id=prototype_id, chats=chats)
+        await self.db.set_model_chat_version(model_id, chat_version)
+        return True
+
+    def _model_version_stale(self, local, remote) -> bool:
+        return version_is_stale(local, ext_int(remote.get("version"), "version"), "version")
 
     def _consul_chat_op_may_be_desync(self, body) -> bool:
         if not body:
@@ -509,10 +733,17 @@ class LocalConductor:
             if existing_id is None:
                 existing_id = ""
             if _norm_acct(existing_id) not in keep_ids:
+                self._stop_account_poller(str(existing_id))
                 await self.db.delete_local_account(str(existing_id))
 
-    async def _reconcile_model_from_consul(self, *, model_id: str, prototype_id) -> None:
+    async def _reconcile_model_from_consul(self, *, model_id: str, prototype_id, respect_write_hold: bool = False) -> None:
         remote = await self.fetch_model_from_consul(model_id=model_id)
+        if respect_write_hold and self._consul_write_held(model_id):
+            return
+        if not self._model_assigned_here(remote):
+            logger.info("consul model moved model_id=%s; dropping local", model_id)
+            await self._remove_local_model(model_id)
+            return
         remote_settings = self._decrypt_model_settings(remote.get("settings"))
         if remote_settings is None:
             logger.error("model settings decrypt failed model_id=%s", model_id)
@@ -525,51 +756,84 @@ class LocalConductor:
         from station.api.instances import precheck_prototype
         if prototype_id is None or not await precheck_prototype(self.app, prototype_id):
             return
-        await apply_consul_model(self.db, model_id, remote)
-        accts = remote.get("accts")
-        if accts is None:
-            accts = []
-        accts = ext_list('accts', accts)
-        remote_ids = set()
-        model_key = str(model_id).replace("-", "").strip().lower()
-        for a in accts:
-            a = ext_dict('acct', a)
-            acct_id = a.get("acct_id")
-            acct_id = ext_str(acct_id, 'acct_id', default="")
-            if not acct_id:
-                raise ExternalError("acct_id must be non-empty str")
-            acct_id = acct_id.replace("-", "").strip().lower()
-            remote_ids.add(acct_id)
-            acct_type = a.get("acct_type")
-            if acct_type is None:
-                acct_type = a.get("type")
-            acct_type = ext_str(acct_type, 'acct_type')
-            username = ext_str(a.get("acct_username"), "acct_username")
-            server = ext_str(a.get("server"), "server")
-            encrypted_token = ext_str(a.get("acct_token"), "acct_token")
-            await self.db.upsert_local_account(
-                acct_id=acct_id,
-                model_id=model_id,
-                prototype_id=prototype_id,
-                acct_type=acct_type.strip(),
-                username=username.strip(),
-                server=server.strip(),
-                encrypted_token=encrypted_token.strip(),
-                is_local=True,
+        if respect_write_hold and self._consul_write_held(model_id):
+            return
+        remote = await self.fetch_model_from_consul(model_id=model_id)
+        if respect_write_hold and self._consul_write_held(model_id):
+            return
+        if not self._model_assigned_here(remote):
+            logger.info("consul model moved model_id=%s; dropping local", model_id)
+            await self._remove_local_model(model_id)
+            return
+        remote_settings = self._decrypt_model_settings(remote.get("settings"))
+        if remote_settings is None:
+            logger.error("model settings decrypt failed model_id=%s", model_id)
+            raise ExternalError("Model settings decrypt failed", status=500)
+        remote = dict(remote)
+        remote["settings"] = remote_settings
+        if remote.get("prototype_id") is not None:
+            prototype_id = ext_int(remote.get("prototype_id"), "prototype_id")
+        remote["prototype_id"] = prototype_id
+        local_now = await self.db.get_model(model_id)
+        if self._model_version_stale(local_now, remote):
+            logger.error(
+                "stale model snapshot model_id=%s remote=%s local=%s",
+                model_id,
+                remote.get("version"),
+                local_now.get("version"),
             )
-        for la in await self.db.list_local_accounts():
-            local_model = str(la.get("model_id") or "").replace("-", "").strip().lower()
-            if local_model != model_key:
-                continue
-            stored = str(la.get("acct_id") or "")
-            lid = stored.replace("-", "").strip().lower()
-            if lid in remote_ids and stored.replace("-", "").strip().lower() == stored.strip().lower():
-                continue
-            await self.db.delete_local_account(stored)
-        chats = await self.fetch_model_chats_from_consul(model_id=model_id)
-        await self.db.replace_model_chats(model_id=model_id, prototype_id=prototype_id, chats=chats)
+        else:
+            await apply_consul_model(self.db, model_id, remote)
+            accts = remote.get("accts")
+            if accts is None:
+                accts = []
+            accts = ext_list('accts', accts)
+            remote_ids = set()
+            model_key = str(model_id).replace("-", "").strip().lower()
+            for a in accts:
+                a = ext_dict('acct', a)
+                acct_id = a.get("acct_id")
+                acct_id = ext_str(acct_id, 'acct_id', default="")
+                if not acct_id:
+                    raise ExternalError("acct_id must be non-empty str")
+                acct_id = acct_id.replace("-", "").strip().lower()
+                remote_ids.add(acct_id)
+                acct_type = a.get("acct_type")
+                if acct_type is None:
+                    acct_type = a.get("type")
+                acct_type = ext_str(acct_type, 'acct_type')
+                username = ext_str(a.get("acct_username"), "acct_username")
+                server = ext_str(a.get("server"), "server")
+                encrypted_token = ext_str(a.get("acct_token"), "acct_token")
+                await self.db.upsert_local_account(
+                    acct_id=acct_id,
+                    model_id=model_id,
+                    prototype_id=prototype_id,
+                    acct_type=acct_type.strip(),
+                    username=username.strip(),
+                    server=server.strip(),
+                    encrypted_token=encrypted_token.strip(),
+                    is_local=True,
+                )
+            for la in await self.db.list_local_accounts():
+                local_model = str(la.get("model_id") or "").replace("-", "").strip().lower()
+                if local_model != model_key:
+                    continue
+                stored = str(la.get("acct_id") or "")
+                lid = stored.replace("-", "").strip().lower()
+                if lid in remote_ids and stored.replace("-", "").strip().lower() == stored.strip().lower():
+                    continue
+                self._stop_account_poller(stored)
+                await self.db.delete_local_account(stored)
+        chats, chat_version = await self.fetch_model_chats_from_consul(model_id=model_id)
+        await self._apply_chats_if_current(
+            model_id=model_id,
+            prototype_id=prototype_id,
+            chats=chats,
+            chat_version=chat_version,
+        )
 
-    async def ensure_chat_mapping(self, *, acct_id: str, chat_id: str, chat_type: str, carrier_user_id: str | None, force: bool = False) -> str | None:
+    async def ensure_chat_mapping(self, *, acct_id: str, chat_id: str, chat_type: str, carrier_user_id: str | None, force: bool = False) -> ChatMapping:
         if acct_id is None:
             acct_id = ""
         if chat_id is None:
@@ -577,14 +841,14 @@ class LocalConductor:
         acct_id = acct_id.strip()
         chat_id = chat_id.strip()
         if not (acct_id and chat_id):
-            return None
+            return ChatMapping()
         if not force:
             existing = await self.db.lookup_model_for_chat(acct_id=acct_id, chat_id=chat_id)
             if existing:
-                return existing
+                return ChatMapping(model_id=existing)
         acct = await self.db.get_local_account(acct_id)
         if not acct:
-            return None
+            return ChatMapping()
         try:
             base_type = chat_type if chat_type else acct.get("acct_type")
             chat_type = validate_local_platform_type(
@@ -593,13 +857,13 @@ class LocalConductor:
             )
         except ExternalError as e:
             logger.error("chat type invalid acct_id=%s chat_id=%s error=%s", acct_id, chat_id, e)
-            return None
+            return ChatMapping()
         model_id = acct.get("model_id")
         if model_id is None:
             model_id = ""
         model_id = model_id.strip()
         if not model_id:
-            return None
+            return ChatMapping()
         if carrier_user_id is None:
             carrier = "unknown"
         else:
@@ -611,27 +875,55 @@ class LocalConductor:
             "chat_type": chat_type,
             "carrier_user_id": carrier,
         }
-        body = await self._consul_post_full(
-            path="/api/local_conductor/add_chat_to_model",
-            payload=payload,
-        )
-        if self._consul_chat_op_may_be_desync(body):
-            prototype_id = acct.get("prototype_id")
-            stored_model = await self.db.get_model(model_id)
-            if stored_model and stored_model.get("prototype_id") is not None:
-                prototype_id = stored_model.get("prototype_id")
-            try:
-                await self._reconcile_model_from_consul(model_id=model_id, prototype_id=prototype_id)
-            except ExternalError as exc:
-                logger.error("chat reconcile failed model_id=%s error=%s", model_id, exc)
-                raise
-            except Exception as e:
-                logger.error("unexpected where=chat_reconcile model_id=%s error=%s", model_id, e, exc_info=e)
-                raise
+        async with self.consul_write(model_id, acct_id):
+            return await self._ensure_chat_mapping_in_consul(
+                acct=acct,
+                acct_id=acct_id,
+                chat_id=chat_id,
+                model_id=model_id,
+                payload=payload,
+            )
+
+    async def _refuse_chat_mapping(self, *, acct_id, chat_id, text) -> ChatMapping:
+        await self._reply_local(acct_id=acct_id, chat_id=chat_id, text=text)
+        return ChatMapping(settled=True)
+
+    def _add_chat_notice(self, body) -> str:
+        code = str(body.get("code") or "")
+        msg = str(body.get("msg") or "")
+        if code.endswith(".max_chats") or "max chats" in msg.lower():
+            return _MAX_CHATS
+        return _ADD_CHAT_ERROR
+
+    async def _ensure_chat_mapping_in_consul(self, *, acct, acct_id, chat_id, model_id, payload) -> ChatMapping:
+        try:
             body = await self._consul_post_full(
                 path="/api/local_conductor/add_chat_to_model",
                 payload=payload,
             )
+            if self._consul_chat_op_may_be_desync(body):
+                prototype_id = acct.get("prototype_id")
+                stored_model = await self.db.get_model(model_id)
+                if stored_model and stored_model.get("prototype_id") is not None:
+                    prototype_id = stored_model.get("prototype_id")
+                try:
+                    await self._reconcile_model_from_consul(model_id=model_id, prototype_id=prototype_id)
+                except ExternalError as exc:
+                    logger.error("chat reconcile failed model_id=%s error=%s", model_id, exc)
+                    return await self._refuse_chat_mapping(acct_id=acct_id, chat_id=chat_id, text=_ADD_CHAT_ERROR)
+                except Exception as e:
+                    logger.error("unexpected where=chat_reconcile model_id=%s error=%s", model_id, e, exc_info=e)
+                    return await self._refuse_chat_mapping(acct_id=acct_id, chat_id=chat_id, text=_ADD_CHAT_ERROR)
+                body = await self._consul_post_full(
+                    path="/api/local_conductor/add_chat_to_model",
+                    payload=payload,
+                )
+        except ExternalError as e:
+            logger.error("add_chat failed model_id=%s acct_id=%s chat_id=%s error=%s", model_id, acct_id, chat_id, e)
+            return await self._refuse_chat_mapping(acct_id=acct_id, chat_id=chat_id, text=_ADD_CHAT_ERROR)
+        except Exception as e:
+            logger.error("unexpected where=add_chat model_id=%s acct_id=%s chat_id=%s error=%s", model_id, acct_id, chat_id, e, exc_info=e)
+            return await self._refuse_chat_mapping(acct_id=acct_id, chat_id=chat_id, text=_ADD_CHAT_ERROR)
         if body.get("result") != 0:
             logger.error(
                 "add_chat failed model_id=%s acct_id=%s chat_id=%s result=%s msg=%s",
@@ -641,7 +933,11 @@ class LocalConductor:
                 body.get("result"),
                 body.get("msg"),
             )
-            return None
+            return await self._refuse_chat_mapping(
+                acct_id=acct_id,
+                chat_id=chat_id,
+                text=self._add_chat_notice(body),
+            )
         stored_model = await self.db.get_model(model_id)
         prototype_id = stored_model.get("prototype_id") if stored_model and stored_model.get("prototype_id") is not None else None
         await self.db.upsert_local_chat(
@@ -649,10 +945,10 @@ class LocalConductor:
             chat_id=chat_id,
             model_id=model_id,
             prototype_id=prototype_id,
-            chat_type=chat_type,
-            carrier_user_id=carrier_user_id,
+            chat_type=payload["chat_type"],
+            carrier_user_id=payload["carrier_user_id"],
         )
-        return model_id
+        return ChatMapping(model_id=model_id)
 
     async def _note_start_failed(self, model_id, instance, error):
         from station.api.instances import instance_kind, isolate_instance
@@ -719,18 +1015,54 @@ class LocalConductor:
                 task.add_done_callback(tasks.discard)
         return instance
 
-    async def _reply_local(self, *, acct_id, chat_id, text):
-        acct, token, adapter = await self._resolve_local_account_context(acct_id)
+    async def _reply_local(self, *, acct_id, chat_id, text) -> bool:
+        acct_id = "" if acct_id is None else str(acct_id).strip()
+        chat_id = "" if chat_id is None else str(chat_id).strip()
+        text = "" if text is None else str(text).strip()
+        if not acct_id or not chat_id or not text:
+            return False
+        try:
+            acct, token, adapter = await self._resolve_local_account_context(acct_id)
+        except ExternalError as e:
+            logger.error("local reply account failed acct_id=%s chat_id=%s error=%s", acct_id, chat_id, e)
+            return False
         if not acct or not token or adapter is None:
-            return
+            return False
         if not adapter.supports("send_message"):
-            return
-        await adapter.send_message(
-            acct=acct,
-            token=token,
-            chat_id=chat_id,
-            text=text,
-        )
+            return False
+        try:
+            sent = await adapter.send_message(
+                acct=acct,
+                token=token,
+                chat_id=chat_id,
+                text=text,
+            )
+        except asyncio.CancelledError:
+            raise
+        except ExternalError as e:
+            logger.error("local reply failed acct_id=%s chat_id=%s error=%s", acct_id, chat_id, e)
+            return False
+        except Exception as e:
+            logger.error("unexpected where=local_reply acct_id=%s chat_id=%s error=%s", acct_id, chat_id, e, exc_info=e)
+            return False
+        return bool(sent)
+
+    async def _settle_notice(self, *, model_id, request_id, acct_id, chat_id, text, terminal: bool) -> bool:
+        sent = await self._reply_local(acct_id=acct_id, chat_id=chat_id, text=text)
+        if sent or terminal:
+            if request_id:
+                await self.db.remember_request("%s:%s" % (model_id, request_id))
+            return True
+        return False
+
+    def _decrypt_settings_or_none(self, settings, *, model_id):
+        try:
+            return self._decrypt_model_settings(settings)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.error("model settings decrypt failed model_id=%s error=%s", model_id, e, exc_info=e)
+            return None
 
     async def _send_chat_opened(self, *, acct_id: str, chat_id: str, model_id: str | None = None, instance=None, chat_type: str = "") -> bool:
         if acct_id is None:
@@ -752,6 +1084,8 @@ class LocalConductor:
             chat_id=chat_id,
             text="Chat opened.",
         )
+        if ok and model_id:
+            await self.db.mark_local_chat_opened(acct_id=acct_id, chat_id=chat_id, model_id=model_id)
         if ok:
             if chat_type == "group":
                 await self._notify_group_message_settings(
@@ -932,16 +1266,48 @@ class LocalConductor:
         if not model:
             try:
                 remote = await self.fetch_model_from_consul(model_id=model_id)
+            except asyncio.CancelledError:
+                raise
             except ExternalError as e:
                 if e.status == 404:
                     logger.error("model not in consul model_id=%s error=%s", model_id, e)
-                    return False
+                    return await self._settle_notice(
+                        model_id=model_id,
+                        request_id=request_id,
+                        acct_id=acct_id,
+                        chat_id=chat_id,
+                        text=_MODEL_UNAVAILABLE,
+                        terminal=True,
+                    )
                 logger.error("fetch_model failed model_id=%s error=%s", model_id, e)
-                raise
-            remote_settings = self._decrypt_model_settings(remote.get("settings"))
+                return await self._settle_notice(
+                    model_id=model_id,
+                    request_id=request_id,
+                    acct_id=acct_id,
+                    chat_id=chat_id,
+                    text=_COULD_NOT_REACH,
+                    terminal=False,
+                )
+            except Exception as e:
+                logger.error("unexpected where=fetch_model model_id=%s error=%s", model_id, e, exc_info=e)
+                return await self._settle_notice(
+                    model_id=model_id,
+                    request_id=request_id,
+                    acct_id=acct_id,
+                    chat_id=chat_id,
+                    text=_COULD_NOT_REACH,
+                    terminal=False,
+                )
+            remote_settings = self._decrypt_settings_or_none(remote.get("settings"), model_id=model_id)
             if remote_settings is None:
-                logger.error("model settings decrypt failed model_id=%s", model_id)
-                raise ExternalError("Model settings decrypt failed", status=500)
+                return await self._settle_notice(
+                    model_id=model_id,
+                    request_id=request_id,
+                    acct_id=acct_id,
+                    chat_id=chat_id,
+                    text=_MODEL_INTERNAL,
+                    terminal=True,
+                )
             remote = dict(remote)
             remote["settings"] = remote_settings
             remote_pid = remote.get("prototype_id")
@@ -949,32 +1315,49 @@ class LocalConductor:
                 remote_pid = ext_int(remote_pid, "prototype_id")
             from station.api.instances import PROTOTYPE_FAILED_REPLY, precheck_prototype
             if remote_pid is None or not await precheck_prototype(self.app, remote_pid):
-                await self._reply_local(acct_id=acct_id, chat_id=chat_id, text=PROTOTYPE_FAILED_REPLY)
-                if request_id:
-                    await self.db.remember_request("%s:%s" % (model_id, request_id))
-                return True
+                return await self._settle_notice(
+                    model_id=model_id,
+                    request_id=request_id,
+                    acct_id=acct_id,
+                    chat_id=chat_id,
+                    text=PROTOTYPE_FAILED_REPLY,
+                    terminal=True,
+                )
             model = await apply_consul_model(self.db, model_id, remote)
         prototype_id = model.get("prototype_id")
-        settings = self._decrypt_model_settings(model.get("settings"))
+        settings = self._decrypt_settings_or_none(model.get("settings"), model_id=model_id)
         if settings is None:
-            return False
+            return await self._settle_notice(
+                model_id=model_id,
+                request_id=request_id,
+                acct_id=acct_id,
+                chat_id=chat_id,
+                text=_MODEL_INTERNAL,
+                terminal=True,
+            )
         from station.api.instances import ModelStartError
         try:
             instance = await self._ensure_instance(model_id=model_id, prototype_id=prototype_id, settings=settings)
         except ModelStartError:
             from station.api.instances import MODEL_START_FAILED_REPLY
-            await self._reply_local(acct_id=acct_id, chat_id=chat_id, text=MODEL_START_FAILED_REPLY)
-            if request_id:
-                await self.db.remember_request("%s:%s" % (model_id, request_id))
-            return True
+            return await self._settle_notice(
+                model_id=model_id,
+                request_id=request_id,
+                acct_id=acct_id,
+                chat_id=chat_id,
+                text=MODEL_START_FAILED_REPLY,
+                terminal=True,
+            )
         if instance is None:
-            from station.api.instances import PROTOTYPE_FAILED_REPLY, prototype_start_failed
-            if prototype_start_failed(self.app, prototype_id):
-                await self._reply_local(acct_id=acct_id, chat_id=chat_id, text=PROTOTYPE_FAILED_REPLY)
-                if request_id:
-                    await self.db.remember_request("%s:%s" % (model_id, request_id))
-                return True
-            return False
+            from station.api.instances import PROTOTYPE_FAILED_REPLY
+            return await self._settle_notice(
+                model_id=model_id,
+                request_id=request_id,
+                acct_id=acct_id,
+                chat_id=chat_id,
+                text=PROTOTYPE_FAILED_REPLY,
+                terminal=True,
+            )
         text = ext_str(body.get("text"), "text").strip()
         platform = body.get("platform")
         if platform is None:
@@ -1008,6 +1391,22 @@ class LocalConductor:
                 opened_chat_type = body.get("chat_type") or ""
                 if opened_chat_type not in ("group", "private"):
                     opened_chat_type = ""
+                fields = text.split()
+                arg = fields[1] if len(fields) > 1 else ""
+                if arg:
+                    reply = await self._local_start_reply(
+                        model_id=model_id,
+                        acct_id=acct_id,
+                        chat_id=chat_id,
+                        arg=arg,
+                        chat_type=opened_chat_type,
+                    )
+                    if reply is not None:
+                        if reply:
+                            await self._reply_local(acct_id=acct_id, chat_id=chat_id, text=reply)
+                        if request_id:
+                            await self.db.remember_request("%s:%s" % (model_id, request_id))
+                        return True
                 await self._send_chat_opened(
                     acct_id=acct_id,
                     chat_id=chat_id,
@@ -1033,10 +1432,52 @@ class LocalConductor:
                 request_id=request_id,
             )
         if accepted is False:
+            if not getattr(instance, "_started", True):
+                return await self._settle_notice(
+                    model_id=model_id,
+                    request_id=request_id,
+                    acct_id=acct_id,
+                    chat_id=chat_id,
+                    text=_MODEL_BUSY,
+                    terminal=False,
+                )
             return False
         if request_id:
             await self.db.remember_request("%s:%s" % (model_id, request_id))
         return True
+
+    async def _local_start_reply(self, *, model_id: str, acct_id: str, chat_id: str, arg: str, chat_type: str) -> str | None:
+        kind = classify_start_arg(model_id, arg, chat_type)
+        if kind == "format":
+            logger.warning("otp token invalid model_id=%s", model_id)
+            return "Invalid token format."
+        if kind == "mismatch_group":
+            logger.debug(
+                "otp model mismatch expected=%s got=%s chat_type=%s",
+                (model_id or "").replace("-", ""),
+                arg[:32],
+                chat_type,
+            )
+            return ""
+        if kind == "mismatch_private":
+            logger.warning(
+                "otp model mismatch expected=%s got=%s chat_type=%s",
+                (model_id or "").replace("-", ""),
+                arg[:32],
+                chat_type,
+            )
+            return "Invalid token. Please retry."
+        if await self.db.local_chat_opened(acct_id=acct_id, chat_id=chat_id, model_id=model_id):
+            return "Chat already opened."
+        try:
+            valid = await self.db.verify_local_otp(model_id, acct_id, start_otp_token(arg))
+        except Exception as e:
+            logger.error("otp verify failed model_id=%s error=%s", model_id, e, exc_info=e)
+            return "Error verifying token."
+        if not valid:
+            logger.warning("otp invalid model_id=%s", model_id)
+            return "Invalid token. Please retry."
+        return None
 
     async def _parse_body_and_file(self, request: web.Request) -> tuple[dict, bytes | None]:
         if request.content_type and request.content_type.startswith("multipart/"):
@@ -1163,7 +1604,7 @@ class LocalConductor:
             return err("Missing model_id", status=400)
 
         remote = await self.fetch_model_from_consul(model_id=model_id)
-        chats = await self.fetch_model_chats_from_consul(model_id=model_id)
+        chats, chat_version = await self.fetch_model_chats_from_consul(model_id=model_id)
         remote_pid = remote.get("prototype_id")
         if remote_pid is None:
             remote_pid = prototype_id
@@ -1190,11 +1631,29 @@ class LocalConductor:
         from station.api.instances import precheck_prototype
         if not await precheck_prototype(self.app, prototype_id):
             return ok({"ok": True})
-        await apply_consul_model(self.db, model_id, remote)
-
+        if not self._model_assigned_here(remote):
+            logger.info("consul model moved model_id=%s; dropping local", model_id)
+            await self._remove_local_model(model_id)
+            return ok({"ok": True})
+        local_now = await self.db.get_model(model_id)
         try:
-            await self._upsert_consul_accounts(model_id=model_id, prototype_id=prototype_id, remote=remote)
-            await self.db.replace_model_chats(model_id=model_id, prototype_id=prototype_id, chats=chats)
+            if self._model_version_stale(local_now, remote):
+                logger.error(
+                    "stale model snapshot model_id=%s remote=%s local=%s",
+                    model_id,
+                    remote.get("version"),
+                    local_now.get("version"),
+                )
+            else:
+                await apply_consul_model(self.db, model_id, remote)
+                stored_accounts = await self._upsert_consul_accounts(model_id=model_id, prototype_id=prototype_id, remote=remote)
+                await self._drop_accounts_not_in(model_id=model_id, keep=stored_accounts)
+            await self._apply_chats_if_current(
+                model_id=model_id,
+                prototype_id=prototype_id,
+                chats=chats,
+                chat_version=chat_version,
+            )
         except ExternalError as exc:
             return err(str(exc), status=exc.status or 400)
 
@@ -1216,6 +1675,13 @@ class LocalConductor:
                 await instance.stop()
             except Exception as e:
                 logger.error("unexpected where=instance_stop model_id=%s error=%s", model_id, e, exc_info=e)
+        model_key = _norm_acct(model_id)
+        for existing in await self.db.list_local_accounts():
+            if _norm_acct(existing.get("model_id")) != model_key:
+                continue
+            existing_id = str(existing.get("acct_id") or "")
+            self._stop_account_poller(existing_id)
+            await self.db.delete_local_account(existing_id)
         await self.db.delete_local_conductor_state_for_model(model_id)
         await self.db.delete_model(model_id)
 
@@ -1237,7 +1703,10 @@ class LocalConductor:
             if ctx is not None:
                 ctx.token = tenant.token_state.token
         remote = await self.fetch_model_from_consul(model_id=model_id)
-        chats = await self.fetch_model_chats_from_consul(model_id=model_id)
+        if not self._model_assigned_here(remote):
+            logger.info("consul model moved model_id=%s; dropping local", model_id)
+            await self._remove_local_model(model_id)
+            return
         remote_pid = remote.get("prototype_id")
         if remote_pid is None:
             remote_pid = prototype_id
@@ -1263,9 +1732,43 @@ class LocalConductor:
         from station.api.instances import precheck_prototype
         if not await precheck_prototype(self.app, prototype_id):
             return
-        await apply_consul_model(self.db, model_id, remote)
-        await self._upsert_consul_accounts(model_id=model_id, prototype_id=prototype_id, remote=remote)
-        await self.db.replace_model_chats(model_id=model_id, prototype_id=prototype_id, chats=chats)
+        remote = await self.fetch_model_from_consul(model_id=model_id)
+        if not self._model_assigned_here(remote):
+            logger.info("consul model moved model_id=%s; dropping local", model_id)
+            await self._remove_local_model(model_id)
+            return
+        remote_settings = self._decrypt_model_settings(remote.get("settings"))
+        if remote_settings is None:
+            logger.error("model settings decrypt failed model_id=%s", model_id)
+            raise ExternalError("Model settings decrypt failed", status=500)
+        remote = dict(remote)
+        remote["settings"] = remote_settings
+        fresh_pid = remote.get("prototype_id")
+        if fresh_pid is not None:
+            fresh_pid = ext_int(fresh_pid, "prototype_id")
+            if self.require_own_prototype(fresh_pid) is not None:
+                raise ExternalError("Prototype mismatch", status=404)
+            prototype_id = fresh_pid
+        remote["prototype_id"] = prototype_id
+        local_now = await self.db.get_model(model_id)
+        if self._model_version_stale(local_now, remote):
+            logger.error(
+                "stale model snapshot model_id=%s remote=%s local=%s",
+                model_id,
+                remote.get("version"),
+                local_now.get("version"),
+            )
+        else:
+            await apply_consul_model(self.db, model_id, remote)
+            stored_accounts = await self._upsert_consul_accounts(model_id=model_id, prototype_id=prototype_id, remote=remote)
+            await self._drop_accounts_not_in(model_id=model_id, keep=stored_accounts)
+        chats, chat_version = await self.fetch_model_chats_from_consul(model_id=model_id)
+        await self._apply_chats_if_current(
+            model_id=model_id,
+            prototype_id=prototype_id,
+            chats=chats,
+            chat_version=chat_version,
+        )
         await self._ensure_instance(
             model_id=model_id,
             prototype_id=prototype_id,
@@ -1394,6 +1897,15 @@ class LocalConductor:
         from station.api.instances import precheck_prototype
         if not stored and (prototype_id is None or not await precheck_prototype(self.app, prototype_id)):
             return ok({"ok": True})
+        local_now = await self.db.get_model(model_id)
+        if self._model_version_stale(local_now, remote):
+            logger.error(
+                "stale model snapshot model_id=%s remote=%s local=%s",
+                model_id,
+                remote.get("version"),
+                local_now.get("version"),
+            )
+            return ok({"ok": True})
         await apply_consul_model(self.db, model_id, remote)
         if not stored and prototype_id is not None:
             from station.api.instances import ModelStartError
@@ -1441,7 +1953,7 @@ class LocalConductor:
         except ExternalError as exc:
             return err(str(exc), status=400)
         if want_otp:
-            otp = "%06d" % (uuid.uuid4().int % 1000000)
+            otp = await self.db.generate_local_otp(model_id, acct_id)
             return ok({"otp": otp})
         return ok({"ok": True})
 
@@ -1500,7 +2012,7 @@ class LocalConductor:
                 mismatch = self.require_own_prototype(prototype_id)
                 if mismatch is not None:
                     return mismatch
-        chats = await self.fetch_model_chats_from_consul(model_id=model_id)
+        chats, chat_version = await self.fetch_model_chats_from_consul(model_id=model_id)
         body_chats = body.get("chats")
         if body_chats is None:
             body_chats = []
@@ -1512,7 +2024,12 @@ class LocalConductor:
         if _chat_keys(body_chats) != _chat_keys(chats):
             logger.error("chats conflict model_id=%s; consul replaces request", model_id)
         try:
-            await self.db.replace_model_chats(model_id=model_id, prototype_id=prototype_id, chats=chats)
+            await self._apply_chats_if_current(
+                model_id=model_id,
+                prototype_id=prototype_id,
+                chats=chats,
+                chat_version=chat_version,
+            )
         except ExternalError as exc:
             return err(str(exc), status=exc.status or 400)
         return ok({"ok": True})
@@ -1604,6 +2121,8 @@ class LocalConductor:
         if not model_id:
             return err("Missing model_id", status=400)
         if not (await self._prototype_version_ok(request, prototype_id)):
+            return err("Synchronize from consul", status=490)
+        if not (await self._model_versions_ok(request, model_id)):
             return err("Synchronize from consul", status=490)
         chats = await self.db.list_model_chats(model_id=model_id, acct_id=acct_id if acct_id else None)
         return ok({"chats": chats})
@@ -1703,6 +2222,8 @@ class LocalConductor:
         if not (method and model_id and acct_id):
             return err("Invalid path", status=400)
         if not (await self._prototype_version_ok(request, prototype_id)):
+            return err("Synchronize from consul", status=490)
+        if not (await self._model_versions_ok(request, model_id)):
             return err("Synchronize from consul", status=490)
 
         acct, token, adapter = await self._resolve_local_account_context(acct_id)

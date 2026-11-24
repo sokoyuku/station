@@ -10,7 +10,39 @@ from aiohttp import web
 
 from station.api.http import external_response, log_caught
 from station.instant import format as format_instant
-from station.errors import ExternalError
+from station.errors import ExternalError, slug
+
+_LOCAL_CONDUCTOR_PREFIXES = (
+    "/consul/",
+    "/pair/",
+    "/account/",
+    "/user/",
+    "/model/",
+    "/prototype/",
+    "/gateway/",
+    "/webhook/",
+)
+
+
+def _uncaught_signal(request, error):
+    path = request.path or ""
+    local = path.startswith(_LOCAL_CONDUCTOR_PREFIXES)
+    tb = error.__traceback__
+    while tb is not None and tb.tb_next is not None:
+        tb = tb.tb_next
+    func = "unknown"
+    line = 0
+    if tb is not None:
+        func = tb.tb_frame.f_code.co_name
+        line = tb.tb_lineno
+    prefix = "conductor.local" if local else "station"
+    return "%s.unhandled.%s.L%s.%s.%s" % (
+        prefix,
+        slug(func),
+        line,
+        slug(type(error).__name__),
+        slug(path),
+    )
 
 from .context import request_id_var
 
@@ -71,6 +103,7 @@ class Recorder:
         console_handler.addFilter(request_id_filter)
         root.addHandler(console_handler)
 
+        self.log_path = None
         dir_path = self.config.dir_path
         if dir_path:
             os.makedirs(dir_path, exist_ok=True)
@@ -84,6 +117,7 @@ class Recorder:
             file_handler.setFormatter(formatter)
             file_handler.addFilter(request_id_filter)
             root.addHandler(file_handler)
+            self.log_path = file_path
 
         self.logger.setLevel(log_level)
         for name in _VENDOR_LOGGERS:
@@ -243,4 +277,8 @@ class Recorder:
         except Exception as e:
             request["error_logged"] = True
             log_caught(self.logger, e, where="%s %s" % (request.method, request.path))
-            return web.json_response({"result": 1, "msg": "Internal error"}, status=500)
+            code = _uncaught_signal(request, e)
+            return web.json_response(
+                {"result": 1, "msg": "Internal error", "code": code},
+                status=500,
+            )

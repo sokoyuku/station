@@ -812,6 +812,33 @@ class GrokTurn(PrototypeVoice):
             "%s" % task
         )
 
+    async def _halt_sessions(self):
+        task = getattr(self, "_turn_task", None)
+        if task is not None and not task.done():
+            task.cancel()
+            try:
+                await wait(task, PROCESS_STOP_TIMEOUT_S, "grok turn stop")
+            except (asyncio.CancelledError, DeadlineExceeded):
+                logger.info("grok turn stopped model_id=%s", self.model_id)
+        self._turn_active = False
+        calls = list(getattr(self, "_realtime_by_call", {}))
+        for call_key in calls:
+            try:
+                await self._end_realtime(call_key=call_key)
+            except Exception as e:
+                logger.error(
+                    "grok realtime halt failed model_id=%s error=%s",
+                    self.model_id,
+                    e,
+                    exc_info=e,
+                )
+        interrupt = getattr(self, "_interrupt_all_hermes", None)
+        if interrupt is not None:
+            await interrupt()
+
+    async def _resume_sessions(self):
+        await self._kick_queued_turn()
+
     async def _stop_chat(self, *, chat_id, acct_id):
         key = (acct_id, chat_id)
         task = getattr(self, "_turn_task", None)
@@ -1000,18 +1027,19 @@ class GrokTurn(PrototypeVoice):
                     if record:
                         generated.append(record)
 
-                reply_text = await complete_chat(
-                    session=None,
-                    settings=settings,
-                    access_token=access_token,
-                    user_content=content,
-                    sender=turn_sender,
-                    tools=chat_tools(local=self.is_local, live=live),
-                    run_tool=self._run_grok_tool,
-                    on_image=_generated_image,
-                    unread_notice=self._fresh_unread_notice,
-                    on_provider=self._tell_provider,
-                )
+                async with self.typing_while(chat_id=chat_id, acct_id=acct_id):
+                    reply_text = await complete_chat(
+                        session=None,
+                        settings=settings,
+                        access_token=access_token,
+                        user_content=content,
+                        sender=turn_sender,
+                        tools=chat_tools(local=self.is_local, live=live),
+                        run_tool=self._run_grok_tool,
+                        on_image=_generated_image,
+                        unread_notice=self._fresh_unread_notice,
+                        on_provider=self._tell_provider,
+                    )
                 if self._grok_reply_ok(reply_text) or generated:
                     saved_reply = reply_text if self._grok_reply_ok(reply_text) else ""
                     self._append_assistant_turn(

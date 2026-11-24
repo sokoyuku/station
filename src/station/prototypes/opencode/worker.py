@@ -4,7 +4,7 @@ import asyncio
 from station import logger
 from station.prototypes.boundary import ext_int, ext_str
 from station.prototypes.bridge_worker import PrototypeBridgeWorker
-from station.prototypes.chat_history import load_session_id, save_session_id
+from station.prototypes.chat_history import list_started_chats, load_session_id, save_session_id
 from station.timeouts import TURN_TIMEOUT_S, wait
 
 @dataclass(slots=True)
@@ -15,6 +15,54 @@ class PendingTurnMessage:
 class OpenCodeWorker(PrototypeBridgeWorker):
     def _bridge_worker_error_text(self, error):
         return "OpenCode bridge error: %s" % error
+
+    async def _each_saved_session(self):
+        for chat in list_started_chats(self.storage_dir):
+            acct_id = chat.get("acct_id") or ""
+            chat_id = chat.get("chat_id") or ""
+            session_id = load_session_id(self.storage_dir, acct_id, chat_id)
+            if acct_id and chat_id and session_id:
+                yield acct_id, chat_id, session_id
+
+    async def _halt_sessions(self):
+        gateway = self._gateway
+        if gateway is None:
+            return
+        async for acct_id, chat_id, session_id in self._each_saved_session():
+            try:
+                await gateway.session_abort(session_id)
+            except Exception as e:
+                logger.error(
+                    "OpenCode halt failed model_id=%s acct_id=%s chat_id=%s error=%s",
+                    self.model_id,
+                    acct_id,
+                    chat_id,
+                    e,
+                    exc_info=e,
+                )
+
+    async def _resume_sessions(self):
+        gateway = self._gateway
+        if gateway is None:
+            return
+        async for acct_id, chat_id, session_id in self._each_saved_session():
+            try:
+                info = await gateway.session_get(session_id)
+            except Exception as e:
+                logger.error(
+                    "OpenCode resume on restore failed model_id=%s acct_id=%s chat_id=%s error=%s",
+                    self.model_id,
+                    acct_id,
+                    chat_id,
+                    e,
+                    exc_info=e,
+                )
+                continue
+            if info is None:
+                continue
+            state = await self._get_chat_state(acct_id=acct_id, chat_id=chat_id)
+            state.session_id = session_id
+            gateway.bind_session(session_id=session_id, acct_id=acct_id, chat_id=chat_id)
 
     async def _enqueue_parts(self, *, parts, chat_id, acct_id, platform="", chat_type="", reply_with_voice=False):
         state = await self._get_chat_state(acct_id=acct_id, chat_id=chat_id)
@@ -41,8 +89,9 @@ class OpenCodeWorker(PrototypeBridgeWorker):
             state.busy = True
             prompt_task = asyncio.create_task(gateway.prompt_async(session_id=state.session_id, parts=parts))
             try:
-                reply = await self._drain_session_events(gateway=gateway, state=state)
-                await gateway.maybe_compact_session(state.session_id)
+                async with self.typing_while(chat_id=chat_id, acct_id=acct_id):
+                    reply = await self._drain_session_events(gateway=gateway, state=state)
+                    await gateway.maybe_compact_session(state.session_id)
             finally:
                 if prompt_task.done():
                     await prompt_task

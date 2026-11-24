@@ -76,6 +76,7 @@ def _postmaster_diffs(current: Config, loaded: Config) -> list[str]:
     cs, ls = current.server, loaded.server
     _mark(pending, "host", current.host != loaded.host)
     _mark(pending, "port", current.port != loaded.port)
+    _mark(pending, "station_app", current.station_app != loaded.station_app)
     _mark(pending, "server.listen_backlog", cs.listen_backlog != ls.listen_backlog)
     _mark(pending, "env", current.env != loaded.env)
     _mark(pending, "server.inbound_workers", cs.inbound_workers != ls.inbound_workers)
@@ -149,6 +150,7 @@ def _restore_postmaster(dst: Config, src: Config) -> None:
     dst.env = src.env
     dst.host = src.host
     dst.port = src.port
+    dst.station_app = src.station_app
     dst.consul_url = loaded_consul
     dst.fs_root = src.fs_root
     dst.database = copy.deepcopy(src.database)

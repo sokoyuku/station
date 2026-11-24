@@ -82,9 +82,14 @@ class Database(LocalConductorDatabaseMixin, AsyncDatabase):
                         version INTEGER,
                         account_id TEXT,
                         accts TEXT,
-                        created_at TEXT
+                        created_at TEXT,
+                        chat_version INTEGER NOT NULL DEFAULT 0
                     )
                 """)
+                model_cols = {row[1] for row in conn.execute("PRAGMA table_info(models)").fetchall()}
+                if "chat_version" not in model_cols:
+                    conn.execute("ALTER TABLE models ADD COLUMN chat_version INTEGER NOT NULL DEFAULT 0")
+                    conn.execute("UPDATE models SET version = 0")
                 conn.execute("DROP TABLE IF EXISTS requests")
                 conn.execute("""
                     CREATE TABLE IF NOT EXISTS inbound_pending (
@@ -200,33 +205,45 @@ class Database(LocalConductorDatabaseMixin, AsyncDatabase):
         settings_obj = data.get("settings")
         if settings_obj is None:
             settings_obj = {}
-        version = data.get("version", 1)
         account_id = data.get("account_id")
         if account_id is None:
             account_id = ""
         accts_obj = data.get("accts")
         if accts_obj is None:
             accts_obj = []
-        payload = (
-            model_id,
-            prototype_id,
-            conductor_addr,
-            json.dumps(settings_obj),
-            version,
-            account_id,
-            json.dumps(accts_obj),
-            instant.format(instant.now()),
-        )
+        settings_json = json.dumps(settings_obj)
+        accts_json = json.dumps(accts_obj)
+        created_at = instant.format(instant.now())
 
         def _sync():
             with self._connect() as conn:
+                row = conn.execute(
+                    "SELECT version, chat_version FROM models WHERE model_id = ?",
+                    (model_id,),
+                ).fetchone()
+                version = data.get("version")
+                if version is None:
+                    version = row[0] if row is not None and row[0] is not None else 0
+                chat_version = data.get("chat_version")
+                if chat_version is None:
+                    chat_version = row[1] if row is not None and row[1] is not None else 0
                 conn.execute(
                     """
                     INSERT OR REPLACE INTO models
-                    (model_id, prototype_id, conductor_addr, settings, version, account_id, accts, created_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    (model_id, prototype_id, conductor_addr, settings, version, account_id, accts, created_at, chat_version)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
-                    payload,
+                    (
+                        model_id,
+                        prototype_id,
+                        conductor_addr,
+                        settings_json,
+                        version,
+                        account_id,
+                        accts_json,
+                        created_at,
+                        chat_version,
+                    ),
                 )
 
         await run_in_db_executor(_sync)
@@ -235,7 +252,7 @@ class Database(LocalConductorDatabaseMixin, AsyncDatabase):
         def _sync():
             with self._connect() as conn:
                 cursor = conn.execute(
-                    "SELECT model_id, prototype_id, conductor_addr, settings, version, account_id, accts, created_at FROM models WHERE model_id = ?",
+                    "SELECT model_id, prototype_id, conductor_addr, settings, version, account_id, accts, created_at, chat_version FROM models WHERE model_id = ?",
                     (model_id,),
                 )
                 row = cursor.fetchone()
@@ -252,6 +269,7 @@ class Database(LocalConductorDatabaseMixin, AsyncDatabase):
                     "account_id": row[5],
                     "accts": accts,
                     "created_at": row[7],
+                    "chat_version": row[8],
                 }
 
         return await run_in_db_executor(_sync)
@@ -260,7 +278,7 @@ class Database(LocalConductorDatabaseMixin, AsyncDatabase):
         def _sync():
             with self._connect() as conn:
                 rows = conn.execute(
-                    "SELECT model_id, prototype_id, conductor_addr, settings, version, account_id, accts, created_at FROM models"
+                    "SELECT model_id, prototype_id, conductor_addr, settings, version, account_id, accts, created_at, chat_version FROM models"
                 ).fetchall()
             out = []
             for row in rows:
@@ -275,10 +293,21 @@ class Database(LocalConductorDatabaseMixin, AsyncDatabase):
                     "account_id": row[5],
                     "accts": accts,
                     "created_at": row[7],
+                    "chat_version": row[8],
                 })
             return out
 
         return await run_in_db_executor(_sync)
+
+    async def set_model_chat_version(self, model_id, chat_version):
+        def _sync():
+            with self._connect() as conn:
+                conn.execute(
+                    "UPDATE models SET chat_version = ? WHERE model_id = ?",
+                    (chat_version, model_id),
+                )
+
+        await run_in_db_executor(_sync)
 
     async def update_model_secrets(self, model_id, *, settings, accts):
         payload = (json.dumps(settings), json.dumps(accts), model_id)

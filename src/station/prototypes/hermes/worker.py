@@ -8,7 +8,7 @@ from station import logger
 from station.prototypes.boundary import ext_mapping_get, ext_result_dict, ext_str
 from station.prototypes.hermes.gateway_client import hermes_child_env
 from station.prototypes.bridge_worker import ChatBridgeState, PrototypeBridgeWorker
-from station.prototypes.chat_history import load_session_id, save_session_id
+from station.prototypes.chat_history import list_started_chats, load_session_id, save_session_id
 from station.prototypes.outbound_files import STATION_OUTBOUND_HINT
 from station.prototypes.voice import PrototypeVoice
 
@@ -63,6 +63,55 @@ class HermesWorker(PrototypeVoice, PrototypeBridgeWorker):
 
     def _bridge_worker_should_respawn(self, state):
         return state.pending_request is None and (not state.busy) and bool(state.pending_messages)
+
+    async def _each_saved_session(self):
+        for chat in list_started_chats(self.storage_dir):
+            acct_id = chat.get("acct_id") or ""
+            chat_id = chat.get("chat_id") or ""
+            session_id = load_session_id(self.storage_dir, acct_id, chat_id)
+            if acct_id and chat_id and session_id:
+                yield acct_id, chat_id, session_id
+
+    async def _halt_sessions(self):
+        gateway = self._gateway
+        if gateway is None:
+            return
+        async for acct_id, chat_id, session_id in self._each_saved_session():
+            try:
+                await gateway.interrupt_session(session_id=session_id)
+            except Exception as e:
+                logger.error(
+                    "Hermes halt failed model_id=%s acct_id=%s chat_id=%s error=%s",
+                    self.model_id,
+                    acct_id,
+                    chat_id,
+                    e,
+                    exc_info=e,
+                )
+
+    async def _resume_sessions(self):
+        gateway = self._gateway
+        if gateway is None:
+            return
+        async for acct_id, chat_id, session_id in self._each_saved_session():
+            try:
+                resumed = await gateway.session_resume(session_id)
+            except Exception as e:
+                logger.error(
+                    "Hermes resume on restore failed model_id=%s acct_id=%s chat_id=%s error=%s",
+                    self.model_id,
+                    acct_id,
+                    chat_id,
+                    e,
+                    exc_info=e,
+                )
+                continue
+            if not resumed:
+                continue
+            state = await self._get_chat_state(acct_id=acct_id, chat_id=chat_id)
+            state.session_id = resumed
+            if resumed != session_id:
+                save_session_id(self.storage_dir, acct_id, chat_id, resumed)
 
     def _bridge_worker_error_text(self, error):
         return "Hermes bridge error: %s" % error
@@ -375,6 +424,18 @@ class HermesWorker(PrototypeVoice, PrototypeBridgeWorker):
         delta_parts = []
         dest = self._session_reply_dest(state=state, chat_id=chat_id, acct_id=acct_id)
 
+        async with self.typing_while(chat_id=dest["chat_id"], acct_id=dest["acct_id"]):
+            await self._read_session_events(
+                gateway=gateway,
+                state=state,
+                queue=queue,
+                delta_parts=delta_parts,
+                dest=dest,
+                chat_id=chat_id,
+                acct_id=acct_id,
+            )
+
+    async def _read_session_events(self, *, gateway, state, queue, delta_parts, dest, chat_id, acct_id):
         while True:
             try:
                 event = await asyncio.wait_for(queue.get(), timeout=1800.0)

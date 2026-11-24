@@ -63,6 +63,7 @@ async function start(attempt = 0) {
       const id = sock.user?.id || '';
       const userId = String(id).split(':')[0].split('@')[0];
       emit('linked', { user_id: userId || id });
+      try { sock.end(undefined); } catch {}
       setTimeout(() => process.exit(0), 1500);
     }
 

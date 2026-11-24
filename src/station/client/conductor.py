@@ -59,6 +59,16 @@ async def _sync_prototype_from_consul(ctx):
     await apply_consul_prototype(ctx.db, fetched, ctx)
     return True
 
+async def _sync_model_from_consul(ctx, model_id, token):
+    from station.client.consul import fetch_model
+    from station.database.consul_state import apply_consul_model
+
+    remote = await fetch_model(session=ctx.session, consul_url=ctx.consul_url, token=token, model_id=model_id)
+    await apply_consul_model(ctx.db, model_id, remote)
+    if ctx.model_versions is not None and model_id:
+        ctx.model_versions.pop(model_id, None)
+    return True
+
 def _ext_addr(value, name):
     if value is None:
         return ""
@@ -114,6 +124,28 @@ async def _conductor_address_from_consul(ctx, model_id, token, body):
     await _update_conductor_addr(ctx, model_id, consul_addr)
     return consul_addr
 
+async def _cached_model_versions(ctx, model_id):
+    if not model_id:
+        return 0, 0
+    cached = ctx.model_versions.get(model_id)
+    if cached is not None:
+        return cached
+    version = 0
+    chat_version = 0
+    if ctx.db is not None:
+        stored = await ctx.db.get_model(model_id)
+        if stored is not None:
+            version = int(stored.get("version") or 0)
+            chat_version = int(stored.get("chat_version") or 0)
+    ctx.model_versions[model_id] = (version, chat_version)
+    return version, chat_version
+
+
+def _set_model_version_headers(headers, version, chat_version):
+    headers["X-Model-Version"] = str(version)
+    headers["X-Chat-Version"] = str(chat_version)
+
+
 async def _maybe_add_prototype_version_header(ctx, headers):
     version = ctx.prototype_version
     if version is None and ctx.db and ctx.prototype_id:
@@ -127,19 +159,25 @@ async def _maybe_add_prototype_version_header(ctx, headers):
         version = 0
     headers["X-Prototype-Version"] = str(version)
 
-def _build_headers_fast(ctx, token):
+def _build_headers_fast(ctx, token, model_id=None):
     headers = {}
     if token:
         headers["X-Prototype-Token"] = token
     version = ctx.prototype_version
     headers["X-Prototype-Version"] = str(0 if version is None else version)
+    cached = ctx.model_versions.get(model_id) if model_id else None
+    if cached is None:
+        cached = (0, 0)
+    _set_model_version_headers(headers, cached[0], cached[1])
     return headers
 
-async def _build_headers(ctx, token):
+async def _build_headers(ctx, token, model_id=None):
     headers = {}
     if token:
         headers["X-Prototype-Token"] = token
     await _maybe_add_prototype_version_header(ctx, headers)
+    model_version, chat_version = await _cached_model_versions(ctx, model_id)
+    _set_model_version_headers(headers, model_version, chat_version)
     return headers
 
 def _local_tenant(ctx):
@@ -328,10 +366,11 @@ async def _conductor_proxy(
         body = dict(params or {})
         request_kwargs, opened_files = _prepare_request_data(body, files, method)
         try:
+            await _cached_model_versions(ctx, model_id)
             if ctx.prototype_version:
-                headers = _build_headers_fast(ctx, token)
+                headers = _build_headers_fast(ctx, token, model_id)
             else:
-                headers = await _build_headers(ctx, token)
+                headers = await _build_headers(ctx, token, model_id)
 
             async def _post():
                 async with ctx.session.post(url, headers=headers, timeout=CONDUCTOR_TIMEOUT, **request_kwargs) as response:
@@ -359,6 +398,7 @@ async def _conductor_proxy(
             if status == 490 and attempt == 0:
                 try:
                     await _sync_prototype_from_consul(ctx)
+                    await _sync_model_from_consul(ctx, model_id, token)
                 except ExternalError as e:
                     logger.error("conductor_proxy prototype sync failed method=%s error=%s", method, e)
                     return False
@@ -456,7 +496,7 @@ async def _gateway_file_transfer(
 
     for attempt in range(max_attempts):
         url = "%s/gateway/%s/%s/%s/%s/%s" % (conductor_url, method, chat_id_str, prototype_id, model_id, acct_id)
-        headers = await _build_headers(ctx, token)
+        headers = await _build_headers(ctx, token, model_id)
 
         async def _post():
             async with ctx.session.post(url, headers=headers, timeout=CONDUCTOR_TIMEOUT, **request_kwargs) as response:
@@ -481,6 +521,7 @@ async def _gateway_file_transfer(
         if status == 490:
             try:
                 await _sync_prototype_from_consul(ctx)
+                await _sync_model_from_consul(ctx, model_id, token)
             except ExternalError as e:
                 logger.error("%s prototype sync failed error=%s", error_label, e)
                 return None

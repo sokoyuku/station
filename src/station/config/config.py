@@ -62,6 +62,7 @@ class PrototypeConfig:
     secret_file: str | None = None
     ava: bool = False
     reply_to: bool = False
+    name: str = ""
 
 @dataclass
 class RecorderConfig:
@@ -115,6 +116,7 @@ class Config:
         self.port = self._get_int("SERVER_PORT", None, allow_none=True)
         self.server = self._load_server_config()
         self.admin_token = self._get_str("STATION_ADMIN_TOKEN", "").strip()
+        self.station_app = self._get_bool("STATION_APP", False)
         self.telegram_api_url = self._get_str("TELEGRAM_API_URL", "").strip().rstrip("/")
         self.telegram_webhook_mode = self._get_bool("TELEGRAM_WEBHOOK_MODE", False)
         self.telegram_webhook_secret = self._get_str("TELEGRAM_WEBHOOK_SECRET", "").strip()
@@ -323,6 +325,10 @@ class Config:
             f"{label}.reply_to",
             self._field_or_default(raw, "reply_to", False),
         )
+        name = ext_str(
+            f"{label}.name",
+            self._field_or_default(raw, "name", ""),
+        )
         return PrototypeConfig(
             id=p_id,
             token=token,
@@ -331,6 +337,7 @@ class Config:
             secret_file=secret_file,
             ava=ava,
             reply_to=reply_to,
+            name=name,
         )
 
     def _load_prototype_configs(self) -> list[PrototypeConfig]:

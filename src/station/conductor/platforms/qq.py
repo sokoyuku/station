@@ -1044,15 +1044,16 @@ class QQIO:
         force = content.startswith("/start")
         model_id = None if force else (await self.conductor.db.lookup_model_for_chat(acct_id=acct_id, chat_id=chat_id))
         if not model_id:
-            model_id = await self.conductor.ensure_chat_mapping(
+            mapped = await self.conductor.ensure_chat_mapping(
                 acct_id=acct_id,
                 chat_id=chat_id,
                 chat_type="qq",
                 carrier_user_id=(user_id or "") or None,
                 force=force,
             )
+            model_id = mapped.model_id
         if not model_id:
-            return False
+            return mapped.settled
         body = {
             "method": "send_message",
             "params": {"text": content},

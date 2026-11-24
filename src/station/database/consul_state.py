@@ -47,8 +47,40 @@ def model_conflicts(local, remote):
         return True
     return False
 
+def _snapshot_version(remote, key):
+    from station.conductor.util import ext_int
+    from station.errors import ExternalError
+
+    value = None if remote is None else remote.get(key)
+    if value is None:
+        raise ExternalError("missing %s" % key, status=502)
+    value = ext_int(value, key)
+    if value <= 0:
+        raise ExternalError("invalid %s" % key, status=502)
+    return value
+
+
+def version_is_stale(local, remote_version, field):
+    if not local or remote_version is None:
+        return False
+    stored = local.get(field)
+    if stored is None:
+        stored = 0
+    stored = int(stored)
+    return stored > 0 and int(remote_version) <= stored
+
+
 async def apply_consul_model(db, model_id, remote):
     local = await db.get_model(model_id)
+    remote_version = _snapshot_version(remote, "version")
+    if version_is_stale(local, remote_version, "version"):
+        logger.error(
+            "stale model snapshot model_id=%s remote=%s local=%s",
+            model_id,
+            remote_version,
+            local.get("version"),
+        )
+        return local
     if local and _acct_rich(local) and not _acct_rich(remote):
         updated = dict(local)
         changed = False

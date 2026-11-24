@@ -261,12 +261,13 @@ class WhatsAppAdapter(LocalPlatformAdapter):
                     media_id = ext_id(msg.get("media_id"), "media_id").strip()
                     if not chat_id or is_whatsapp_broadcast_chat(chat_id) or (not text and not media_id):
                         continue
-                    model_id = await self.conductor.ensure_chat_mapping(
+                    mapped = await self.conductor.ensure_chat_mapping(
                         acct_id=acct_id,
                         chat_id=chat_id,
                         chat_type="whatsapp",
                         carrier_user_id=user_id,
                     )
+                    model_id = mapped.model_id
                     if not model_id:
                         continue
                     attachments = []

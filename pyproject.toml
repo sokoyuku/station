@@ -12,6 +12,10 @@ dynamic = ["dependencies"]
 
 [tool.setuptools]
 package-dir = {"" = "src"}
+include-package-data = false
+
+[tool.setuptools.package-data]
+station = ["web/**/*"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

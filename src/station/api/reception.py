@@ -6,7 +6,8 @@ import time
 import uuid
 from aiohttp import web
 from aiohttp.web_request import FileField
-from station.database.consul_state import apply_consul_prototype, fetch_and_apply_model
+from station.conductor.util import ext_int
+from station.database.consul_state import apply_consul_model, apply_consul_prototype, fetch_and_apply_model
 from station.api.instances import (
     MODEL_START_FAILED_REPLY,
     PROTOTYPE_FAILED_REPLY,
@@ -27,14 +28,16 @@ from station.prototypes.attachments import (
 )
 from station import logger
 from station.api.http import ext_path_int, log_caught, read_json_object
-from station.errors import ExternalError
+from station.errors import ExternalError, auto_code
 from station.prototypes.boundary import ext_bool, ext_dict, ext_list, ext_require, ext_str
 
 def _same_prototype(instance, tenant_id) -> bool:
     return instance.prototype_id == tenant_id
 
-def relay_error(*, reason, msg, status, retryable=None):
-    raise ExternalError(msg, status=status, reason=reason, retryable=retryable)
+def relay_error(*, reason, msg, status, retryable=None, code="", cause=""):
+    if not code:
+        code = auto_code(msg, depth=2)
+    raise ExternalError(msg, status=status, reason=reason, retryable=retryable, code=code, cause_code=cause)
 
 async def _load_model(db, model_id, session, consul_url, token, tenant_id):
     model = await db.get_model(model_id)
@@ -210,12 +213,16 @@ async def _check_or_sync_prototype_version(request, app, tenant):
 
     incoming_version_raw = request.headers.get("X-Prototype-Version") or ""
     if incoming_version_raw == "":
-        raise ExternalError("Synchronize from consul", status=490)
+        raise ExternalError("Synchronize from consul", status=490, code="station.reception.version_header_missing")
     try:
         incoming_version = ext_path_int("X-Prototype-Version", incoming_version_raw)
     except ExternalError as e:
-        logger.error("prototype version invalid error=%s", e)
-        raise ExternalError("Synchronize from consul", status=490) from e
+        logger.error("prototype version invalid code=station.reception.version_header_invalid error=%s", e)
+        raise ExternalError(
+            "Synchronize from consul",
+            status=490,
+            code="station.reception.version_header_invalid",
+        ) from e
 
     ctx = tenant.client_context
     if ctx is not None and ctx.prototype_version is not None:
@@ -246,6 +253,8 @@ async def _check_or_sync_prototype_version(request, app, tenant):
             msg=str(e),
             status=e.status or 502,
             retryable=True if e.retryable is None else e.retryable,
+            code=e.code or "station.reception.consul_fetch_failed",
+            cause=e.cause_code,
         )
     await apply_consul_prototype(db, fetched, ctx)
     if ctx is not None and ctx.prototype_version is not None:
@@ -255,7 +264,123 @@ async def _check_or_sync_prototype_version(request, app, tenant):
     if local_version == incoming_version:
         return None
 
-    return relay_error(reason="", msg="Synchronize from consul", status=490, retryable=True)
+    return relay_error(
+        reason="version_mismatch",
+        msg="Synchronize from consul",
+        status=490,
+        retryable=True,
+        code="station.reception.version_mismatch",
+    )
+
+async def _sync_model_snapshot(app, tenant, model_id, local):
+    lc = app.get("local_conductor")
+    if lc is not None:
+        try:
+            remote = await lc.fetch_model_from_consul(model_id=model_id)
+            remote_settings = lc._decrypt_model_settings(remote.get("settings"))
+            if remote_settings is None:
+                return relay_error(
+                    reason="decrypt_failed",
+                    msg="Model settings decrypt failed",
+                    status=500,
+                    code="station.reception.model_decrypt_failed",
+                )
+            remote = dict(remote)
+            remote["settings"] = remote_settings
+            if not lc._model_version_stale(local, remote):
+                await apply_consul_model(app["db"], model_id, remote)
+            chats, chat_version = await lc.fetch_model_chats_from_consul(model_id=model_id)
+            prototype_id = remote.get("prototype_id")
+            if prototype_id is not None:
+                prototype_id = ext_int(prototype_id, "prototype_id")
+            await lc._apply_chats_if_current(
+                model_id=model_id,
+                prototype_id=prototype_id,
+                chats=chats,
+                chat_version=chat_version,
+            )
+            return None
+        except ExternalError as e:
+            if e.status != 404:
+                logger.error("local model snapshot sync failed model_id=%s code=%s error=%s", model_id, e.code, e)
+    from station.client.consul import fetch_model
+    try:
+        remote = await fetch_model(
+            session=app["session"],
+            consul_url=app["config"].consul_url,
+            token=tenant.token_state.token,
+            model_id=model_id,
+        )
+    except ExternalError as e:
+        return relay_error(
+            reason=e.reason or "consul_request",
+            msg=str(e),
+            status=e.status or 502,
+            retryable=True if e.retryable is None else e.retryable,
+            code=e.code or "station.reception.model_fetch_failed",
+            cause=e.cause_code,
+        )
+    await apply_consul_model(app["db"], model_id, remote)
+    # Model version can stay put while chats advance. apply_consul_model keeps
+    # the stored row in that case, so lift chat_version without moving it backward.
+    remote_chat = remote.get("chat_version")
+    if remote_chat is not None:
+        current = await app["db"].get_model(model_id)
+        current_chat = int((current or {}).get("chat_version") or 0)
+        remote_chat_n = ext_int(remote_chat, "chat_version")
+        if current is not None and remote_chat_n > current_chat:
+            updated = dict(current)
+            updated["chat_version"] = remote_chat_n
+            await app["db"].put_model(model_id, updated)
+    return None
+
+async def _check_or_sync_model_versions(request, app, tenant, model_id):
+    raw_model = request.headers.get("X-Model-Version") or ""
+    raw_chat = request.headers.get("X-Chat-Version") or ""
+    if raw_model == "" or raw_chat == "":
+        return relay_error(
+            reason="version_mismatch",
+            msg="Synchronize from consul",
+            status=490,
+            retryable=True,
+            code="station.reception.model_version_header_missing",
+        )
+    try:
+        incoming_model = ext_path_int("X-Model-Version", raw_model)
+        incoming_chat = ext_path_int("X-Chat-Version", raw_chat)
+    except ExternalError as e:
+        logger.error("model version invalid code=station.reception.model_version_header_invalid error=%s", e)
+        return relay_error(
+            reason="version_mismatch",
+            msg="Synchronize from consul",
+            status=490,
+            retryable=True,
+            code="station.reception.model_version_header_invalid",
+        )
+    db = app["db"]
+    local = await db.get_model(model_id)
+    local_model = int((local or {}).get("version") or 0)
+    local_chat = int((local or {}).get("chat_version") or 0)
+    if local_model >= incoming_model and local_chat >= incoming_chat:
+        return None
+    synced = await _sync_model_snapshot(app, tenant, model_id, local)
+    if synced is not None:
+        return synced
+    local = await db.get_model(model_id)
+    local_model = int((local or {}).get("version") or 0)
+    local_chat = int((local or {}).get("chat_version") or 0)
+    # A newer local snapshot already includes this update. Parallel chats bump
+    # the version while a relay is in flight; requiring an exact match drops
+    # that message with 490 after the station has moved on.
+    if local_model >= incoming_model and local_chat >= incoming_chat:
+        return None
+    return relay_error(
+        reason="version_mismatch",
+        msg="Synchronize from consul",
+        status=490,
+        retryable=True,
+        code="station.reception.model_version_mismatch",
+    )
 
 async def handle_reception(request):
     start = time.perf_counter()
@@ -296,6 +421,9 @@ async def _handle_reception(request):
     token = tenant.token_state.token
 
     version_resp = await _check_or_sync_prototype_version(request, app, tenant)
+    if version_resp is not None:
+        return version_resp
+    version_resp = await _check_or_sync_model_versions(request, app, tenant, model_id)
     if version_resp is not None:
         return version_resp
 
@@ -391,7 +519,13 @@ async def _handle_reception(request):
             model = await _load_model(db, model_id, session, consul_url, token, tenant.id)
         except ExternalError as e:
             if e.status == 404:
-                return relay_error(reason="model_not_found", msg="Model not found", status=404)
+                return relay_error(
+                    reason="model_not_found",
+                    msg="Model not found",
+                    status=404,
+                    code="station.reception.message_model_not_found",
+                    cause=e.code,
+                )
             raise
         if not model:
             return relay_error(reason="model_not_found", msg="Model not found", status=404)
@@ -476,6 +610,9 @@ async def handle_event(request):
     version_resp = await _check_or_sync_prototype_version(request, app, tenant)
     if version_resp is not None:
         return version_resp
+    version_resp = await _check_or_sync_model_versions(request, app, tenant, model_id)
+    if version_resp is not None:
+        return version_resp
 
     request_id = request.headers.get("X-Request-Id", "")
     chat_id = request.headers.get("X-Chat-Id") or ""
@@ -507,7 +644,13 @@ async def handle_event(request):
         model = await _load_model(db, model_id, session, consul_url, token, tenant.id)
     except ExternalError as e:
         if e.status == 404:
-            return relay_error(reason="model_not_found", msg="Model not found", status=404)
+            return relay_error(
+                reason="model_not_found",
+                msg="Model not found",
+                status=404,
+                code="station.reception.event_model_not_found",
+                cause=e.code,
+            )
         raise
     if not model:
         return relay_error(reason="model_not_found", msg="Model not found", status=404)

@@ -25,7 +25,14 @@ def ext_path_int(name, raw):
 
 
 def external_response(error):
-    payload = {"result": 1, "msg": str(error), "data": None}
+    payload = {
+        "result": 1,
+        "msg": str(error),
+        "data": None,
+        "code": error.code,
+    }
+    if error.cause_code:
+        payload["cause"] = error.cause_code
     if error.reason:
         payload["reason"] = error.reason
     if error.retryable is not None:
@@ -34,10 +41,11 @@ def external_response(error):
 
 
 def log_caught(logger, error, *, where):
+    code = getattr(error, "code", "") or ""
     if type(error) is ExternalError:
-        logger.error("external where=%s error=%s", where, error)
+        logger.error("external where=%s code=%s error=%s", where, code, error)
         return
     if type(error) is InternalError:
-        logger.error("internal where=%s error=%s", where, error, exc_info=error)
+        logger.error("internal where=%s code=%s error=%s", where, code, error, exc_info=error)
         return
-    logger.error("unexpected where=%s error=%s", where, error, exc_info=error)
+    logger.error("unexpected where=%s code=%s error=%s", where, code, error, exc_info=error)
