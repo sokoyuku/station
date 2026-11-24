@@ -268,7 +268,6 @@ async def _admin_attach_prototype(
     config_file: str | None = None,
     secret_file: str | None = None,
     persist: bool = False,
-    ava: bool = False,
     reply_to: bool = False,
 ) -> dict:
     station_url = _normalize_base_url(station_url)
@@ -290,7 +289,6 @@ async def _admin_attach_prototype(
         "config_file": config_file,
         "secret_file": secret_file,
         "persist": persist,
-        "ava": ava,
         "reply_to": reply_to,
     }
     status, body, raw = await _post_station_admin(url, payload=payload, headers=headers)
@@ -466,6 +464,7 @@ async def sync_prototype(
     consul_url_override: str | None = None,
     prototype_name_override: str | None = None,
     desired_overrides: dict[str, object] | None = None,
+    default_type: str | None = None,
 ) -> int:
     config_path = (config_path or "").strip() or _get_env("STATION_CONFIG_FILE")
     if not config_path:
@@ -492,7 +491,19 @@ async def sync_prototype(
     override_name = (prototype_name_override or "").strip() or _get_env("PROTOTYPE_NAME") or ""
     if override_name and not any((e.get("name") or "").strip() == override_name for e in named):
         raise RuntimeError(f"[[prototypes]] entry with name={override_name!r} not found")
-    overrides_target = override_name or (named[0].get("name") or "").strip()
+    active_overrides = {
+        key: value
+        for key, value in (desired_overrides or {}).items()
+        if value is not None
+    }
+    overrides_target = ""
+    if active_overrides:
+        if override_name:
+            overrides_target = override_name
+        elif len(named) == 1:
+            overrides_target = (named[0].get("name") or "").strip()
+        else:
+            raise RuntimeError("PROTOTYPE_NAME is required to apply sign-in overrides when more than one prototype is configured")
 
     consul_username, consul_password = _require_consul_credentials(config)
 
@@ -507,6 +518,8 @@ async def sync_prototype(
             name = (entry.get("name") or "").strip()
             payload: dict[str, object] = {"name": name}
             payload.update(_payload_from_prototype_entry(entry))
+            if default_type and "type" not in payload:
+                payload["type"] = default_type
             if desired_overrides and name == overrides_target:
                 for k, v in desired_overrides.items():
                     if v is not None:
@@ -603,7 +616,6 @@ def _build_attach_prototype_parser(prog_name: str) -> argparse.ArgumentParser:
     parser.add_argument("--config-file", dest="config_file", default=None)
     parser.add_argument("--secret-file", dest="secret_file", default=None)
     parser.add_argument("--persist", dest="persist", action="store_true")
-    parser.add_argument("--ava", dest="ava", type=_parse_bool, default=False)
     parser.add_argument("--reply-to", dest="reply_to", type=_parse_bool, default=False)
     parser.add_argument("--description", dest="description", default=None)
     parser.add_argument("--type", dest="type", default=None)
@@ -830,7 +842,6 @@ def _run_attach_prototype(args: argparse.Namespace) -> int:
                 config_file=args.config_file,
                 secret_file=args.secret_file,
                 persist=args.persist,
-                ava=args.ava,
                 reply_to=args.reply_to,
             )
             print(json.dumps({"ok": True, "data": data}, sort_keys=True))
@@ -863,7 +874,6 @@ def _build_run_parser(prog_name: str) -> argparse.ArgumentParser:
     parser.add_argument("--token", dest="token", default=None)
     parser.add_argument("--prototype-config", dest="prototype_config_file", default=None)
     parser.add_argument("--prototype-secret", dest="prototype_secret_file", default=None)
-    parser.add_argument("--ava", dest="ava", type=_parse_bool, default=None)
     parser.add_argument("--description", dest="description")
     parser.add_argument("--type", dest="type")
     parser.add_argument("--access-point", dest="access_point")
@@ -899,7 +909,6 @@ def _start_station(
         token=args.token,
         prototype_config_file=args.prototype_config_file,
         prototype_secret_file=args.prototype_secret_file,
-        ava=args.ava,
         station_app=args.station_app,
         prototype=prototype_class,
         prototype_kind=prototype_kind,
@@ -934,7 +943,7 @@ def run_cli(
     if args.do_signin:
         desired_overrides = {
             "description": args.description,
-            "type": args.type or default_type,
+            "type": args.type,
             "access_point": args.access_point,
             "path": args.path,
             "status": args.status,
@@ -951,6 +960,7 @@ def run_cli(
                 consul_url_override=args.consul_url,
                 prototype_name_override=args.prototype_name,
                 desired_overrides=desired_overrides,
+                default_type=default_type,
             )
         )
         if code != 0:

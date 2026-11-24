@@ -101,7 +101,6 @@ def _append_prototypes_table(
     kind: str,
     config_file: str | None,
     secret_file: str | None,
-    ava: bool,
     reply_to: bool,
     name: str | None = None,
 ) -> None:
@@ -125,7 +124,6 @@ def _append_prototypes_table(
         block.append(f"config_file = {json.dumps(config_file)}")
     if secret_file:
         block.append(f"secret_file = {json.dumps(secret_file)}")
-    block.append(f"ava = {_toml_literal(ava)}")
     block.append(f"reply_to = {_toml_literal(reply_to)}")
     block.append("")
     path.write_text(text + "\n".join(block) + "\n", encoding="utf-8")
@@ -261,7 +259,6 @@ async def handle_admin_add_prototype(request):
     if secret_file is not None:
         secret_file = ext_str("secret_file", secret_file, default="").strip() or None
     persist = ext_bool("persist", body.get("persist", False))
-    ava = ext_bool("ava", body.get("ava", False))
     reply_to = ext_bool("reply_to", body.get("reply_to", False))
 
     if registry.hosts(prototype_id):
@@ -317,11 +314,9 @@ async def handle_admin_add_prototype(request):
             client_context=client_context,
             config_file=config_file,
             secret_file=secret_file,
-            ava=ava,
             reply_to=reply_to,
             is_local=is_local,
         ),
-        primary=False,
     )
 
     config.hosted_prototypes.append(
@@ -331,7 +326,6 @@ async def handle_admin_add_prototype(request):
             kind=kind,
             config_file=config_file,
             secret_file=secret_file,
-            ava=ava,
             reply_to=reply_to,
         )
     )
@@ -350,7 +344,6 @@ async def handle_admin_add_prototype(request):
             kind=kind,
             config_file=config_file,
             secret_file=secret_file,
-            ava=ava,
             reply_to=reply_to,
             name=name,
         )

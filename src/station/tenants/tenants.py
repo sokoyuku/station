@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from station.client.context import ClientContext
-from station.errors import ExternalError, InternalError
+from station.errors import ExternalError
 from station.prototypes.registry import resolve_prototype_class
 from station.tenants.token_state import TokenState
 
@@ -15,7 +15,6 @@ class Tenant:
     client_context: ClientContext | None = None
     config_file: str | None = None
     secret_file: str | None = None
-    ava: bool = False
     reply_to: bool = False
     is_local: bool = False
     _prototype_class: type | None = field(default=None, repr=False)
@@ -35,17 +34,7 @@ class TenantRegistry:
     def __init__(self):
         self._by_id: dict[int, Tenant] = {}
         self._by_token: dict[str, Tenant] = {}
-        self._primary_id: int | None = None
         self._order: list[int] = []
-
-    @property
-    def primary(self) -> Tenant:
-        if self._primary_id is None:
-            raise InternalError("TenantRegistry has no primary tenant")
-        tenant = self._by_id.get(self._primary_id)
-        if tenant is None:
-            raise InternalError("TenantRegistry primary tenant missing")
-        return tenant
 
     @property
     def prototype_ids(self) -> list[int]:
@@ -80,7 +69,7 @@ class TenantRegistry:
         if token:
             self._by_token.pop(token, None)
 
-    def add(self, tenant: Tenant, *, primary: bool = False) -> Tenant:
+    def add(self, tenant: Tenant) -> Tenant:
         if tenant.id is None:
             raise ExternalError("tenant.id is required")
         pid = tenant.id
@@ -96,8 +85,6 @@ class TenantRegistry:
         self._index_token(tenant, token)
         if pid not in self._order:
             self._order.append(pid)
-        if primary or self._primary_id is None:
-            self._primary_id = pid
         return tenant
 
     async def rotate_token(
@@ -108,11 +95,10 @@ class TenantRegistry:
         grace_seconds: int = 300,
     ) -> Tenant:
         if prototype_id is None:
-            tenant = self.primary
-        else:
-            tenant = self.get(prototype_id)
-            if tenant is None:
-                raise ExternalError(f"prototype_id not hosted: {prototype_id}", status=404)
+            raise ExternalError("prototype_id is required")
+        tenant = self.get(prototype_id)
+        if tenant is None:
+            raise ExternalError(f"prototype_id not hosted: {prototype_id}", status=404)
         old_token = tenant.token
         old_previous = tenant.token_state.previous_token
         await tenant.token_state.rotate_token(new_token, grace_seconds=grace_seconds)

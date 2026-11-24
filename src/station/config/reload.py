@@ -65,10 +65,15 @@ def _sighup_diffs(current: Config, loaded: Config) -> list[str]:
         "recorder.smoothing_window",
         current.recorder.smoothing_window != loaded.recorder.smoothing_window,
     )
-    cur_proto = current.prototype
-    load_proto = loaded.prototype
-    _mark(applied, "prototype.ava", cur_proto.ava != load_proto.ava)
-    _mark(applied, "prototype.reply_to", cur_proto.reply_to != load_proto.reply_to)
+    current_by_id = {entry.id: entry for entry in current.hosted_prototypes if entry.id is not None}
+    reply_changed = False
+    for entry in loaded.hosted_prototypes:
+        previous = current_by_id.get(entry.id)
+        if previous is None:
+            continue
+        if previous.reply_to != entry.reply_to:
+            reply_changed = True
+    _mark(applied, "prototype.reply_to", reply_changed)
     return applied
 
 def _postmaster_diffs(current: Config, loaded: Config) -> list[str]:
@@ -128,8 +133,7 @@ def _postmaster_diffs(current: Config, loaded: Config) -> list[str]:
     return pending
 
 def _restore_postmaster(dst: Config, src: Config) -> None:
-    loaded_ava = dst.prototype.ava
-    loaded_reply_to = dst.prototype.reply_to
+    loaded_by_id = {entry.id: entry for entry in dst.hosted_prototypes if entry.id is not None}
     loaded_level = dst.recorder.level
     loaded_smoothing = dst.recorder.smoothing_window
     loaded_consul = dst.consul_url
@@ -162,9 +166,11 @@ def _restore_postmaster(dst: Config, src: Config) -> None:
     )
 
     hosted = copy.deepcopy(src.hosted_prototypes)
-    primary = hosted[0]
-    primary.ava = loaded_ava
-    primary.reply_to = loaded_reply_to
+    for entry in hosted:
+        loaded_entry = loaded_by_id.get(entry.id)
+        if loaded_entry is None:
+            continue
+        entry.reply_to = loaded_entry.reply_to
     dst.hosted_prototypes = hosted
 
 def reload_from_disk(current_config: Config) -> dict[str, Any]:
@@ -200,11 +206,17 @@ def apply_reloaded_config(app, result: dict[str, Any]) -> None:
         local_conductor.config = new_config
 
     tenants = app["tenants"]
-    primary = tenants.primary
-    primary.client_context.consul_url = new_config.consul_url
-    if "prototype.ava" in applied or "prototype.reply_to" in applied:
-        primary.ava = new_config.prototype.ava
-        primary.reply_to = new_config.prototype.reply_to
+    loaded_by_id = {entry.id: entry for entry in new_config.hosted_prototypes if entry.id is not None}
+    live_prototype = "prototype.reply_to" in applied
+    for prototype_id in tenants.prototype_ids:
+        tenant = tenants.get(prototype_id)
+        if tenant is None:
+            continue
+        if tenant.client_context is not None:
+            tenant.client_context.consul_url = new_config.consul_url
+        loaded_entry = loaded_by_id.get(tenant.id)
+        if live_prototype and loaded_entry is not None:
+            tenant.reply_to = loaded_entry.reply_to
 
     from station.client.retry import apply_retry_config
 

@@ -107,14 +107,6 @@ class LocalConductor:
             if not configured.lower().startswith("http://") and not configured.lower().startswith("https://"):
                 configured = "http://" + configured
             return configured
-        access_point = ""
-        if "_prototype_access_point" in self.app:
-            ap = self.app["_prototype_access_point"]
-            access_point = ap.strip().rstrip("/") if ap else ""
-        if access_point:
-            if not access_point.lower().startswith("http://") and not access_point.lower().startswith("https://"):
-                access_point = "http://" + access_point
-            return access_point
         host = self.config.host.strip() if self.config.host else "127.0.0.1"
         port = self.config.port if self.config.port is not None else 0
         return f"http://{host}:{port}".rstrip("/")
@@ -1153,11 +1145,12 @@ class LocalConductor:
             model = await self.db.get_model(model_id)
             if model and model.get("prototype_id") is not None:
                 own_id = model.get("prototype_id")
-        if not own_id:
-            registry = self.app["tenants"]
-            own_id = registry.primary.id
+        if not own_id and instance is not None:
+            raw_id = getattr(instance, "prototype_id", None)
+            if raw_id:
+                own_id = raw_id
         proto = await self.db.get_prototype_info(own_id) if own_id else None
-        if not proto:
+        if own_id and not proto:
             registry = self.app["tenants"]
             tenant = registry.get(own_id)
             if tenant is None:
@@ -1214,8 +1207,7 @@ class LocalConductor:
             return
         own_id = prototype_id or 0
         if not own_id:
-            registry = self.app["tenants"]
-            own_id = registry.primary.id
+            return
         info = await self.db.get_prototype_info(own_id) if own_id else None
         if not info or info.get("call_support") is not True:
             if info is not None and info.get("call_support") is False and adapter.supports("send_message"):

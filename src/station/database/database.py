@@ -107,12 +107,14 @@ class Database(LocalConductorDatabaseMixin, AsyncDatabase):
                         token TEXT,
                         access_point TEXT,
                         type TEXT,
-                        ava BOOLEAN,
                         version INTEGER,
                         raw_data TEXT,
                         created_at TEXT
                     )
                 """)
+                proto_cols = {row[1] for row in conn.execute("PRAGMA table_info(prototypes)").fetchall()}
+                if "ava" in proto_cols:
+                    conn.execute("ALTER TABLE prototypes DROP COLUMN ava")
                 conn.execute(FILES_TABLE_SQL_SQLITE)
                 for stmt in FILES_INDEXES:
                     conn.execute(stmt)
@@ -357,7 +359,6 @@ class Database(LocalConductorDatabaseMixin, AsyncDatabase):
         token = data.get("token", "")
         access_point = data.get("access_point", "")
         proto_type = data.get("type", "subscription")
-        ava = data.get("ava", False)
         version = data.get("version")
         raw_data = json.dumps(data)
         payload = (
@@ -366,7 +367,6 @@ class Database(LocalConductorDatabaseMixin, AsyncDatabase):
             token,
             access_point,
             proto_type,
-            ava,
             version,
             raw_data,
             instant.format(instant.now()),
@@ -377,8 +377,8 @@ class Database(LocalConductorDatabaseMixin, AsyncDatabase):
                 conn.execute(
                     """
                     INSERT OR REPLACE INTO prototypes
-                    (prototype_id, name, token, access_point, type, ava, version, raw_data, created_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    (prototype_id, name, token, access_point, type, version, raw_data, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     payload,
                 )

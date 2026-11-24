@@ -63,8 +63,8 @@ _FIELDS = (
 )
 
 _FIELD_BY_KEY = {row[0]: row for row in _FIELDS}
-_PROTOTYPE_KEYS = ("name", "kind", "config_file", "secret_file", "ava", "reply_to")
-_LIVE_PROTOTYPE_KEYS = ("ava", "reply_to")
+_PROTOTYPE_KEYS = ("name", "kind", "config_file", "secret_file", "reply_to")
+_LIVE_PROTOTYPE_KEYS = ("reply_to",)
 
 
 def _running_value(config, key):
@@ -222,7 +222,6 @@ def _prototypes(config):
                 "kind": str(entry.get("kind") or "station"),
                 "config_file": str(entry.get("config_file") or ""),
                 "secret_file": str(entry.get("secret_file") or ""),
-                "ava": bool(entry.get("ava")),
                 "reply_to": bool(entry.get("reply_to")),
                 "token_set": bool(str(entry.get("token") or "").strip()),
                 "pending": _prototype_pending(config, entry),
@@ -358,8 +357,6 @@ def _prototype_updates(entry):
         updates["config_file"] = ext_str("config_file", entry.get("config_file"), default="")
     if "secret_file" in entry:
         updates["secret_file"] = ext_str("secret_file", entry.get("secret_file"), default="")
-    if "ava" in entry:
-        updates["ava"] = ext_bool("ava", entry.get("ava"))
     if "reply_to" in entry:
         updates["reply_to"] = ext_bool("reply_to", entry.get("reply_to"))
     unknown = set(entry) - set(_PROTOTYPE_KEYS) - {"id"}

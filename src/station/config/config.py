@@ -1,6 +1,5 @@
 import os
 import tomllib
-import re
 from dataclasses import dataclass
 
 from station.errors import ExternalError
@@ -60,7 +59,6 @@ class PrototypeConfig:
     kind: str = "station"
     config_file: str | None = None
     secret_file: str | None = None
-    ava: bool = False
     reply_to: bool = False
     name: str = ""
 
@@ -109,7 +107,7 @@ class Config:
             self.data.update(load_toml_file(explicit_secret_path, "Station secret file"))
             self.secret_file_path = explicit_secret_path
 
-        self.env = self._get_str("ENV", "development")
+        self.env = self._get_str("ENV", "")
         self.consul_url = self._get_str("CONSUL_URL", "")
         self.fs_root = self._get_str("FS_ROOT", "").strip()
         self.host = self._get_str("SERVER_HOST", None, allow_none=True)
@@ -130,10 +128,6 @@ class Config:
         self.hosted_prototypes = self._load_prototype_configs()
         self.recorder = self._load_recorder_config()
         self.local_conductor = self._load_local_conductor_config()
-
-    @property
-    def prototype(self) -> PrototypeConfig:
-        return self.hosted_prototypes[0]
 
     def _resolve_repo_path(self, path: str):
         path = path.strip()
@@ -317,10 +311,6 @@ class Config:
                 raise ExternalError(f"{label}.max_models cannot be negative")
             if cap > 2147483647:
                 raise ExternalError(f"{label}.max_models is too large")
-        ava = ext_bool(
-            f"{label}.ava",
-            self._field_or_default(raw, "ava", False),
-        )
         reply_to = ext_bool(
             f"{label}.reply_to",
             self._field_or_default(raw, "reply_to", False),
@@ -335,7 +325,6 @@ class Config:
             kind=kind,
             config_file=config_file,
             secret_file=secret_file,
-            ava=ava,
             reply_to=reply_to,
             name=name,
         )
@@ -433,17 +422,3 @@ class Config:
             public_key_path=public,
             address=address,
         )
-
-    def _parse_access_point_host_port(self, access_point):
-        access_point = ext_str("access_point", access_point, strip=False)
-        if access_point.startswith("http://"):
-            access_point = access_point[7:]
-        elif access_point.startswith("https://"):
-            access_point = access_point[8:]
-
-        match = re.match(r"^(?:\[(?P<ipv6>[^\]]+)\]|(?P<host>.*)):(?P<port>\d+)$", access_point)
-        if match:
-            host = match.group("ipv6") or match.group("host")
-            port = int(match.group("port"))
-            return host, port
-        return None, None

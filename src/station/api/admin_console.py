@@ -66,7 +66,6 @@ async def _live_instances(app):
 
 def _prototypes(app):
     registry = app["tenants"]
-    primary_id = registry.primary.id
     rows = []
     for prototype_id in registry.prototype_ids:
         tenant = registry.get(prototype_id)
@@ -78,9 +77,7 @@ def _prototypes(app):
                 "id": tenant.id,
                 "kind": tenant.kind,
                 "is_local": bool(tenant.is_local),
-                "ava": bool(tenant.ava),
                 "reply_to": bool(tenant.reply_to),
-                "primary": tenant.id == primary_id,
                 "version": None if ctx is None else ctx.prototype_version,
                 "token_set": bool((tenant.token or "").strip()),
                 "config_file": tenant.config_file or "",
@@ -187,7 +184,6 @@ async def handle_admin_overview(request):
             "port": config.port,
             "needs_manual": bool(app.get("needs_manual")),
             "db_backend": config.database.backend,
-            "primary_prototype_id": registry.primary.id,
             "local_conductor": lc is not None,
             "log_level": log_level,
             "uptime_seconds": max(0, int(time.time() - started_at)),

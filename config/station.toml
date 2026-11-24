@@ -1,0 +1,119 @@
+# Station config. Credentials live in station_secret.toml.
+#
+# Before the first start:
+# 1. Set STATION_ADMIN_TOKEN and each access_point.
+# 2. Fill CONSUL_USERNAME and CONSUL_PASSWORD in the secret. That Consul account
+#    owns the prototypes created below. It must already exist. A local prototype
+#    also needs that account's conductor public key to match the key this
+#    station uses. See LOCAL_CONDUCTOR_* below.
+# 3. The id and token values below are placeholders. The first start must use
+#    --signin. Sign-in creates any missing prototype for the signed-in account
+#    and rewrites id and token in this file. Later starts can use --no-signin.
+#
+# Each prototype loads the class for its kind.
+#
+#   PYTHONPATH=station/src python3 -m station.run_station \
+#     --config /path/to/station.toml \
+#     --secret /path/to/station_secret.toml \
+#     --signin --app
+#
+# Paths below are relative to the process working directory.
+
+CONSUL_URL = "https://api.sokoyuku.com"
+STATION_SECRET_FILE = "station_secret.toml"
+DB_PATH = "db/station.db"
+DB_BACKEND = "sqlite"
+WIPE_ON_RESTART = false
+FS_ROOT = "fs"
+STATION_APP = true
+
+# Private token entered in the station console.
+STATION_ADMIN_TOKEN = ""
+
+TELEGRAM_API_URL = "https://api.telegram.org"
+TELEGRAM_WEBHOOK_MODE = true
+DISCORD_API_URL = "https://discord.com/api/v9"
+WHATSAPP_CLOUD_API_URL = "https://graph.facebook.com"
+QQ_API_URL = "https://api.sgroup.qq.com"
+QQ_TOKEN_URL = "https://bots.qq.com/app/getAppAccessToken"
+
+# Optional. Read only when a hosted prototype is local. An omitted or empty
+# value takes the default.
+# PRIVATE_KEY_PATH: create db/local_conductor_key.pem beside DB_PATH.
+# PUBLIC_KEY_PATH: that private path plus .pub. Station writes the public token there.
+# ADDRESS: http://SERVER_HOST:SERVER_PORT. Set a public URL when Telegram or
+# another platform must call this station from outside this machine.
+# WHATSAPP_BRIDGE_DIR, WHATSAPP_SESSION_DIR, and NODE are environment variables,
+# not keys in this file. Bridge dir defaults to scripts/whatsapp-bridge, session
+# dir to whatsapp_sessions beside the database, and NODE to node on PATH.
+LOCAL_CONDUCTOR_PRIVATE_KEY_PATH = "local_conductor_key.pem"
+LOCAL_CONDUCTOR_PUBLIC_KEY_PATH = "local_conductor_key.pem.pub"
+LOCAL_CONDUCTOR_ADDRESS = ""
+
+SERVER_HOST = "localhost"
+SERVER_PORT = 8880
+
+LOG_DIR_PATH = "logs"
+LOG_LEVEL = "INFO"
+LOG_FORMAT = "%(asctime)s - [%(request_id)s] - %(name)s - %(levelname)s - %(message)s"
+LOG_MAX_BYTES = 10485760
+LOG_BACKUP_COUNT = 5
+SMOOTHING_WINDOW = 100
+
+REQUEST_DEDUPE_TTL_SECONDS = 3600
+DEDUPE_CLEANUP_INTERVAL_SECONDS = 600
+
+STATION_INBOUND_WORKERS = 4
+STATION_INBOUND_QUEUE = 32768
+STATION_INBOUND_AT_LEAST_ONCE = true
+STATION_OUTBOUND_CONCURRENCY = 0
+STATION_LISTEN_BACKLOG = 8192
+STATION_INSTANCE_ISOLATE_AFTER = 3
+STATION_OUTBOUND_RETRY_ATTEMPTS = 3
+STATION_OUTBOUND_RETRY_BASE_SECONDS = 0.5
+STATION_OUTBOUND_CIRCUIT_FAILURES = 5
+STATION_OUTBOUND_CIRCUIT_COOLDOWN_SECONDS = 1.0
+
+[[prototypes]]
+name = "Local Hermes"
+description = """
+## Local Hermes
+
+Private local bridge to Hermes.
+
+- Runs on your Conductor access point
+- WhatsApp accounts can be linked with a QR code
+"""
+id = 1
+token = "pending-hermes"
+kind = "hermes"
+config_file = "hermes.toml"
+type = "subscription"
+access_point = ""
+is_local = true
+whatsapp_qr = true
+private = true
+max_chats = 5
+call_support = false
+
+[[prototypes]]
+name = "Local Grok"
+description = """
+## Local Grok
+
+Private local bridge to Grok.
+
+- Runs on your Conductor access point
+- WhatsApp accounts can be linked with a QR code
+"""
+id = 2
+token = "pending-grok"
+kind = "grok"
+config_file = "grok.toml"
+type = "subscription"
+access_point = ""
+is_local = true
+whatsapp_qr = true
+private = true
+max_chats = 5
+call_support = false

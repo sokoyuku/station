@@ -45,7 +45,6 @@ class Station:
         token=None,
         prototype_config_file=None,
         prototype_secret_file=None,
-        ava=None,
         station_app=None,
         prototype=None,
         prototype_kind=None,
@@ -72,17 +71,27 @@ class Station:
             self.config.database.path = db_path
         if fs_root is not None:
             self.config.fs_root = fs_root
-        primary = self.config.prototype
-        if prototype_id is not None:
-            primary.id = prototype_id
-        if token is not None:
-            primary.token = token
-        if prototype_config_file is not None:
-            primary.config_file = ext_str("prototype_config_file", prototype_config_file, default="").strip() or None
-        if prototype_secret_file is not None:
-            primary.secret_file = ext_str("prototype_secret_file", prototype_secret_file, default="").strip() or None
-        if ava is not None:
-            primary.ava = ava
+        hosted = self.config.hosted_prototypes
+        single_overrides = (
+            prototype_id is not None
+            or token is not None
+            or prototype_config_file is not None
+            or prototype_secret_file is not None
+        )
+        if single_overrides:
+            if len(hosted) != 1:
+                raise ExternalError(
+                    "prototype_id, token, prototype_config_file, and prototype_secret_file apply only when one prototype is configured"
+                )
+            only = hosted[0]
+            if prototype_id is not None:
+                only.id = prototype_id
+            if token is not None:
+                only.token = token
+            if prototype_config_file is not None:
+                only.config_file = ext_str("prototype_config_file", prototype_config_file, default="").strip() or None
+            if prototype_secret_file is not None:
+                only.secret_file = ext_str("prototype_secret_file", prototype_secret_file, default="").strip() or None
         if station_app is not None:
             self.config.station_app = ext_bool("station_app", station_app)
 
@@ -91,29 +100,16 @@ class Station:
             for kind_name, kind_cls in kinds.items():
                 register_kind(kind_name, kind_cls)
 
-        self._primary_prototype_class = None
         if prototype is not None:
             ext_require("prototype", prototype, (type,))
-            kind = prototype_kind
-            if kind is None:
-                kind = primary.kind or "station"
-            kind = ext_str("prototype_kind", kind, default="")
-            if not kind:
-                raise ExternalError("prototype_kind must be non-empty str")
-            register_kind(kind, prototype)
-            primary.kind = kind
-            self._primary_prototype_class = prototype
-        elif prototype_kind is not None:
+            if prototype_kind is None:
+                raise ExternalError("prototype_kind is required")
             kind = ext_str("prototype_kind", prototype_kind, default="")
             if not kind:
                 raise ExternalError("prototype_kind must be non-empty str")
-            primary.kind = kind
-
-        self.prototype_id = primary.id
-        if self.prototype_id is None:
-            raise ExternalError("prototypes[0].id is required")
-        if not primary.token:
-            raise ExternalError("prototypes[0].token is required")
+            register_kind(kind, prototype)
+        elif prototype_kind is not None:
+            raise ExternalError("prototype_kind requires a prototype class")
 
         self.db = None
         self.app = None
@@ -127,7 +123,6 @@ class Station:
                 "ok": True,
                 "ready": True,
                 "needs_manual": self.app["needs_manual"],
-                "prototype_id": self.prototype_id,
                 "prototype_ids": registry.prototype_ids,
             }
         )
@@ -268,43 +263,12 @@ class Station:
             if not consul_url:
                 raise ExternalError("CONSUL_URL is required (env or config.toml).")
 
-            primary_cfg = self.config.prototype
-            primary_token = primary_cfg.token
-            if not primary_token:
-                raise ExternalError("prototypes[0].token is required")
-
-            session = self._make_session()
-            primary_fetched = await self._fetch_prototype_with_retry(
-                session, consul_url, primary_token
-            )
-
-            if primary_fetched.get("prototype_id") is not None:
-                self.prototype_id = ext_int("prototype_id", primary_fetched["prototype_id"])
-                primary_cfg.id = self.prototype_id
-
-            prototype_access_point = ""
-            if "access_point" in primary_fetched:
-                prototype_access_point = ext_str("access_point", primary_fetched["access_point"], default="")
-
-            if not self.config.host or not self.config.port:
-                if not prototype_access_point:
-                    raise ExternalError("Prototype access_point from Consul must be a non-empty string.")
-
-                host, port = self.config._parse_access_point_host_port(prototype_access_point)
-                if not host or not port:
-                    raise ExternalError("Invalid prototype access_point: %s" % prototype_access_point)
-
-                self.config.host = host
-                self.config.port = port
-
             if not self.config.host or not self.config.port:
                 raise ExternalError(
                     "Station listen address not resolved. Set SERVER_HOST/SERVER_PORT (env or config.toml), or pass --host/--port."
                 )
 
-            if "is_local" not in primary_fetched:
-                raise ExternalError("fetch_prototype is_local is required")
-            primary_is_local = ext_bool("is_local", primary_fetched["is_local"])
+            session = self._make_session()
 
             self.recorder = Recorder("station", self.config.recorder, port=self.config.port)
             self.logger = self.recorder.logger
@@ -320,14 +284,11 @@ class Station:
             self.app["needs_manual"] = False
             self.app["started_at"] = time.time()
             self.app.on_startup.append(self._register_sighup)
-            self.app["_prototype_access_point"] = prototype_access_point
             self.app["env"] = self.config.env
             self.app["recorder"] = self.recorder
             self.app["logger"] = self.logger
             self.app["session"] = session
             self.app["fs_root"] = self.config.fs_root
-            self.app["prototype_config_file"] = self.config.prototype.config_file
-            self.app["prototype_secret_file"] = self.config.prototype.secret_file
             self.app["webrtc"] = WebRTCService(config=self.config, session=session)
             self.app["discord_voice"] = DiscordVoiceService(session=session)
             self.app["config"] = self.config
@@ -348,22 +309,19 @@ class Station:
             self.app["db"] = self.db
 
             registry = TenantRegistry()
-            for idx, cfg in enumerate(self.config.hosted_prototypes):
-                is_primary = idx == 0
+            for cfg in self.config.hosted_prototypes:
                 pid = cfg.id
                 token = cfg.token
                 kind = cfg.kind
-                if is_primary:
-                    fetched = primary_fetched
-                    is_local = primary_is_local
-                else:
-                    fetched = await self._fetch_prototype_with_retry(session, consul_url, token)
-                    if fetched.get("prototype_id") is not None:
-                        pid = ext_int("prototype_id", fetched["prototype_id"])
-                        cfg.id = pid
-                    if "is_local" not in fetched:
-                        raise ExternalError("fetch_prototype is_local is required")
-                    is_local = ext_bool("is_local", fetched["is_local"])
+                if not token:
+                    raise ExternalError("prototype_id=%s requires a token" % pid)
+                fetched = await self._fetch_prototype_with_retry(session, consul_url, token)
+                if fetched.get("prototype_id") is not None:
+                    pid = ext_int("prototype_id", fetched["prototype_id"])
+                    cfg.id = pid
+                if "is_local" not in fetched:
+                    raise ExternalError("fetch_prototype is_local is required")
+                is_local = ext_bool("is_local", fetched["is_local"])
 
                 token_state = TokenState(token)
                 proto_version = 0
@@ -390,20 +348,10 @@ class Station:
                     client_context=client_context,
                     config_file=cfg.config_file,
                     secret_file=cfg.secret_file,
-                    ava=cfg.ava,
                     reply_to=cfg.reply_to,
                     is_local=is_local,
                 )
-                if is_primary and self._primary_prototype_class is not None:
-                    tenant._prototype_class = self._primary_prototype_class
-                registry.add(tenant, primary=is_primary)
-
-            primary_tenant = registry.primary
-            self.prototype_id = primary_tenant.id
-            primary_cfg = self.config.prototype
-            primary_cfg.id = primary_tenant.id
-            primary_cfg.token = primary_tenant.token
-            primary_cfg.kind = primary_tenant.kind
+                registry.add(tenant)
 
             self.app["tenants"] = registry
             self.app["local_conductor"] = None

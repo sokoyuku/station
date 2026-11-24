@@ -235,13 +235,13 @@ class PostgresDatabase(AsyncDatabase):
                         token TEXT,
                         access_point TEXT,
                         type TEXT,
-                        ava BOOLEAN,
                         version INTEGER,
                         raw_data TEXT,
                         created_at TIMESTAMPTZ
                     )
                     """
                 )
+                await conn.execute("ALTER TABLE prototypes DROP COLUMN IF EXISTS ava")
                 await conn.execute("CREATE INDEX IF NOT EXISTS idx_inbound_pending_model_id ON inbound_pending(model_id)")
                 await conn.execute(
                     "CREATE INDEX IF NOT EXISTS idx_inbound_pending_created_at ON inbound_pending(created_at)"
@@ -601,21 +601,19 @@ class PostgresDatabase(AsyncDatabase):
         token = data.get("token", "")
         access_point = data.get("access_point", "")
         proto_type = data.get("type", "subscription")
-        ava = data.get("ava", False)
         version = data.get("version")
         raw_data = json.dumps(data)
         async with self.pool.acquire() as conn:
             await conn.execute(
                 """
                 INSERT INTO prototypes
-                (prototype_id, name, token, access_point, type, ava, version, raw_data, created_at)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                (prototype_id, name, token, access_point, type, version, raw_data, created_at)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
                 ON CONFLICT (prototype_id) DO UPDATE SET
                     name = EXCLUDED.name,
                     token = EXCLUDED.token,
                     access_point = EXCLUDED.access_point,
                     type = EXCLUDED.type,
-                    ava = EXCLUDED.ava,
                     version = EXCLUDED.version,
                     raw_data = EXCLUDED.raw_data,
                     created_at = EXCLUDED.created_at
@@ -625,7 +623,6 @@ class PostgresDatabase(AsyncDatabase):
                 token,
                 access_point,
                 proto_type,
-                ava,
                 version,
                 raw_data,
                 instant.now(),

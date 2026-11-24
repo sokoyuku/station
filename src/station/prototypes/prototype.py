@@ -91,10 +91,19 @@ class Prototype(PrototypeCli, PrototypeCommands, PrototypeEcho, PrototypeWebRTC,
                     kind=tenant.kind,
                     config_file=tenant.config_file,
                     secret_file=tenant.secret_file,
-                    ava=tenant.ava,
                     reply_to=tenant.reply_to,
                 )
-        return self.app["config"].prototype
+        from station.config.config import PrototypeConfig
+
+        token = ""
+        if self.client_context is not None and self.client_context.token:
+            token = self.client_context.token
+        return PrototypeConfig(
+            id=self.prototype_id,
+            token=token,
+            config_file=self.config_file,
+            secret_file=self.secret_file,
+        )
 
     @property
     def is_local(self):
@@ -422,11 +431,9 @@ class Prototype(PrototypeCli, PrototypeCommands, PrototypeEcho, PrototypeWebRTC,
         await self._handle_inbound_context(ctx)
 
     async def _handle_inbound_context(self, ctx):
-        echo_file = self.prototype_config.ava or ctx.attachments != []
-
         await self.echo_inbound(
             ctx.data,
-            echo_file=echo_file,
+            echo_file=True,
             chat_id=ctx.chat_id,
             acct_id=ctx.acct_id,
             request_id=ctx.request_id,
